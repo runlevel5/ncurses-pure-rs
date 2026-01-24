@@ -1,0 +1,58 @@
+[package]
+name = "ncurses-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Trung Le"]
+description = "A pure Rust implementation of the ncurses library, XSI Curses compliant"
+rust-version = "1.93.0"
+license = "MIT"
+repository = "https://github.com/runlevel5/ncurses-pure-rust"
+keywords = ["ncurses", "curses", "terminal", "tui", "xsi"]
+categories = ["command-line-interface", "api-bindings"]
+
+[features]
+default = ["wide", "mouse", "ext-colors"]
+
+# Wide character support (cchar_t, wchar_t functions)
+# Required for full Unicode support
+wide = []
+
+# Mouse event handling support
+mouse = []
+
+# Extended colors (>256 color pairs)
+ext-colors = []
+
+# Soft function key labels
+slk = []
+
+# Panels library
+panels = []
+
+# Menu library
+menu = []
+
+# Form library
+form = []
+
+# Regular expression support for form validation (requires regex crate)
+regex = ["dep:regex"]
+
+# Enable all features
+full = ["wide", "mouse", "ext-colors", "slk", "panels", "menu", "form", "regex", "trace", "sp-funcs"]
+
+# Thread-safe SCREEN pointer functions (_sp variants)
+sp-funcs = []
+
+# Enable tracing for debugging
+trace = []
+
+[dependencies]
+libc = "0.2"
+bitflags = "2.4"
+unicode-width = "0.1"
+thiserror = "1.0"
+regex = { version = "1.10", optional = true }
+
+[dev-dependencies]
+tempfile = "3.10"

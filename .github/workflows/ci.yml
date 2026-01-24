@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Format check
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Clippy lints
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Clippy (no features)
+        run: cargo clippy -- -D warnings
+      - name: Clippy (all features)
+        run: cargo clippy --all-features -- -D warnings
+
+  # Build and test on multiple platforms
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      # Build with no features
+      - name: Build (no features)
+        run: cargo build --verbose
+
+      # Build with individual features
+      - name: Build (wide)
+        run: cargo build --features wide --verbose
+      - name: Build (mouse)
+        run: cargo build --features mouse --verbose
+      - name: Build (ext-colors)
+        run: cargo build --features ext-colors --verbose
+      - name: Build (slk)
+        run: cargo build --features slk --verbose
+      - name: Build (panels)
+        run: cargo build --features panels --verbose
+      - name: Build (menu)
+        run: cargo build --features menu --verbose
+      - name: Build (form)
+        run: cargo build --features form --verbose
+
+      # Build with all features
+      - name: Build (all features)
+        run: cargo build --all-features --verbose
+
+      # Run tests
+      - name: Test (no features)
+        run: cargo test --verbose
+      - name: Test (all features)
+        run: cargo test --all-features --verbose
+
+  # Build examples
+  examples:
+    name: Examples (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Build example (hello)
+        run: cargo build --example hello
+      - name: Build example (keys)
+        run: cargo build --example keys
+      - name: Build example (colors)
+        run: cargo build --example colors
+      - name: Build example (windows)
+        run: cargo build --example windows
+      - name: Build example (mouse)
+        run: cargo build --example mouse --features mouse
+      - name: Build example (panels)
+        run: cargo build --example panels --features panels
+      - name: Build example (menu)
+        run: cargo build --example menu --features menu
+      - name: Build example (form)
+        run: cargo build --example form --features form
+
+  # Documentation
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Build documentation
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Minimum Supported Rust Version
+  msrv:
+    name: MSRV (1.93.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # master
+        with:
+          toolchain: "1.93.0"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      # Remove lock file to avoid version 4 lock file incompatibility
+      # and let Cargo resolve dependencies for this Rust version
+      - name: Remove lock file
+        run: rm -f Cargo.lock
+      - name: Build
+        run: cargo build --all-features
