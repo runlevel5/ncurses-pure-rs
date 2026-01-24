@@ -2,9 +2,20 @@
 //!
 //! This module provides low-level terminal I/O functionality using
 //! POSIX termios for terminal configuration and control.
+//!
+//! # Safety
+//!
+//! This module contains unsafe code for interfacing with POSIX terminal APIs.
+//! All unsafe blocks are carefully reviewed and documented with safety invariants.
+//! The unsafe code is limited to:
+//! - `libc::tcgetattr`/`libc::tcsetattr` for terminal attribute manipulation
+//! - `libc::ioctl` for terminal size queries
+//! - `libc::read`/`libc::write` for raw terminal I/O
+//! - `libc::select` for input availability checking
 
 use crate::error::{Error, Result};
 use std::io;
+use std::mem::MaybeUninit;
 use std::os::unix::io::RawFd;
 
 /// Terminal state flags for tracking initialization.
@@ -33,14 +44,26 @@ pub struct TermSettings {
 impl TermSettings {
     /// Create empty settings.
     pub fn new() -> Self {
+        // SAFETY: `libc::termios` is a C struct that can be safely zero-initialized.
+        // All fields are primitive types (integers and arrays of integers) that have
+        // valid zero representations. The struct will be properly initialized by
+        // `tcgetattr` before use.
+        let termios = unsafe {
+            let t = MaybeUninit::<libc::termios>::zeroed();
+            t.assume_init()
+        };
         Self {
-            termios: unsafe { std::mem::zeroed() },
+            termios,
             saved: false,
         }
     }
 
     /// Save current terminal settings.
     pub fn save(&mut self, fd: RawFd) -> Result<()> {
+        // SAFETY: `tcgetattr` is a POSIX function that reads terminal attributes.
+        // - `fd` is a valid file descriptor (checked by the caller)
+        // - `&mut self.termios` is a valid pointer to a `libc::termios` struct
+        // - The function will fully initialize the termios struct on success
         let result = unsafe { libc::tcgetattr(fd, &mut self.termios) };
         if result == 0 {
             self.saved = true;
@@ -57,6 +80,11 @@ impl TermSettings {
         if !self.saved {
             return Ok(());
         }
+        // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+        // - `fd` is a valid file descriptor (checked by the caller)
+        // - `&self.termios` points to a valid, initialized `libc::termios` struct
+        //   (guaranteed by `self.saved == true`, which is only set after successful `tcgetattr`)
+        // - `TCSANOW` is a valid action flag
         let result = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.termios) };
         if result == 0 {
             Ok(())
@@ -118,13 +146,21 @@ pub struct Terminal {
 impl Terminal {
     /// Create a new terminal with the given file descriptors.
     pub fn new(input_fd: RawFd, output_fd: RawFd) -> Result<Self> {
+        // SAFETY: `libc::termios` is a C struct that can be safely zero-initialized.
+        // All fields are primitive types that have valid zero representations.
+        // The struct will be properly initialized by `tcgetattr` below.
+        let current = unsafe {
+            let t = MaybeUninit::<libc::termios>::zeroed();
+            t.assume_init()
+        };
+
         let mut term = Self {
             input_fd,
             output_fd,
             state: TermState::Unknown,
             shell_settings: TermSettings::new(),
             prog_settings: TermSettings::new(),
-            current: unsafe { std::mem::zeroed() },
+            current,
             term_type: String::new(),
             lines: 24,
             columns: 80,
@@ -137,7 +173,11 @@ impl Terminal {
             has_il: true, // Will be updated in detect_terminal
         };
 
-        // Get current terminal settings
+        // SAFETY: `tcgetattr` is a POSIX function that reads terminal attributes.
+        // - `input_fd` is provided by the caller and expected to be a valid terminal fd
+        // - `&mut term.current` is a valid pointer to a `libc::termios` struct
+        // - On success, the entire termios struct is initialized
+        // - On failure, we return an error before using the uninitialized struct
         let result = unsafe { libc::tcgetattr(input_fd, &mut term.current) };
         if result != 0 {
             return Err(Error::SystemError(
@@ -527,7 +567,19 @@ impl Terminal {
 
     /// Update terminal size from the system.
     pub fn update_size(&mut self) -> Result<()> {
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: `libc::winsize` is a C struct that can be safely zero-initialized.
+        // All fields are primitive integer types with valid zero representations.
+        // The struct will be initialized by the `ioctl` call below.
+        let mut ws = unsafe {
+            let w = MaybeUninit::<libc::winsize>::zeroed();
+            w.assume_init()
+        };
+
+        // SAFETY: `ioctl` with `TIOCGWINSZ` reads the terminal window size.
+        // - `self.output_fd` is a valid file descriptor (validated in `new()`)
+        // - `&mut ws` is a valid pointer to a `libc::winsize` struct
+        // - `TIOCGWINSZ` is a valid ioctl request for getting window size
+        // - On success, ws.ws_row and ws.ws_col contain the terminal dimensions
         let result = unsafe { libc::ioctl(self.output_fd, libc::TIOCGWINSZ, &mut ws) };
 
         if result == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
@@ -572,6 +624,11 @@ impl Terminal {
         new_settings.c_cc[libc::VMIN] = 1;
         new_settings.c_cc[libc::VTIME] = 0;
 
+        // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+        // - `&new_settings` points to a valid, initialized `libc::termios` struct
+        //   (copied from `self.current` which was initialized by `tcgetattr`)
+        // - `TCSANOW` applies changes immediately
         let result = unsafe { libc::tcsetattr(self.input_fd, libc::TCSANOW, &new_settings) };
         if result != 0 {
             return Err(Error::SystemError(
@@ -623,6 +680,10 @@ impl Terminal {
             new_settings.c_iflag |= libc::IXON | libc::ICRNL;
         }
 
+        // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+        // - `&new_settings` points to a valid `libc::termios` struct (copied from `self.current`)
+        // - `TCSANOW` applies changes immediately
         let result = unsafe { libc::tcsetattr(self.input_fd, libc::TCSANOW, &new_settings) };
         if result == 0 {
             self.current = new_settings;
@@ -647,6 +708,10 @@ impl Terminal {
             new_settings.c_lflag |= libc::ICANON;
         }
 
+        // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+        // - `&new_settings` points to a valid `libc::termios` struct (copied from `self.current`)
+        // - `TCSANOW` applies changes immediately
         let result = unsafe { libc::tcsetattr(self.input_fd, libc::TCSANOW, &new_settings) };
         if result == 0 {
             self.current = new_settings;
@@ -668,6 +733,10 @@ impl Terminal {
             new_settings.c_lflag &= !libc::ECHO;
         }
 
+        // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+        // - `&new_settings` points to a valid `libc::termios` struct (copied from `self.current`)
+        // - `TCSANOW` applies changes immediately
         let result = unsafe { libc::tcsetattr(self.input_fd, libc::TCSANOW, &new_settings) };
         if result == 0 {
             self.current = new_settings;
@@ -703,6 +772,11 @@ impl Terminal {
             return Ok(());
         }
 
+        // SAFETY: `libc::write` writes data to a file descriptor.
+        // - `self.output_fd` is a valid file descriptor (validated in `new()`)
+        // - `self.output_buffer.as_ptr()` returns a valid pointer to the buffer's data
+        // - `self.output_buffer.len()` is the exact number of bytes to write
+        // - The buffer remains valid and unchanged during the write call
         let result = unsafe {
             libc::write(
                 self.output_fd,
@@ -725,6 +799,11 @@ impl Terminal {
     /// Read a single byte from the terminal.
     pub fn read_byte(&self) -> Result<Option<u8>> {
         let mut buf = [0u8; 1];
+        // SAFETY: `libc::read` reads data from a file descriptor.
+        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+        // - `buf.as_mut_ptr()` returns a valid pointer to a 1-byte buffer
+        // - The size argument (1) matches the buffer size exactly
+        // - The buffer is stack-allocated and remains valid during the read call
         let result = unsafe { libc::read(self.input_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
 
         if result > 0 {
@@ -743,8 +822,18 @@ impl Terminal {
 
     /// Check if input is available.
     pub fn has_input(&self) -> bool {
+        // SAFETY: This unsafe block uses `select` to check for available input.
+        // - `libc::fd_set` is zero-initialized, which is the correct initial state
+        // - `FD_ZERO` clears the set (redundant but safe)
+        // - `FD_SET` adds our file descriptor to the set
+        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+        // - `select` is called with a zero timeout for non-blocking check
+        // - All pointers passed to `select` are valid stack-allocated variables
         unsafe {
-            let mut fds: libc::fd_set = std::mem::zeroed();
+            let mut fds = {
+                let f = MaybeUninit::<libc::fd_set>::zeroed();
+                f.assume_init()
+            };
             libc::FD_ZERO(&mut fds);
             libc::FD_SET(self.input_fd, &mut fds);
 
@@ -902,6 +991,11 @@ impl Terminal {
     /// Restore the saved program terminal settings.
     pub fn restore_prog_mode(&mut self) -> Result<()> {
         if self.prog_settings.is_saved() {
+            // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+            // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+            // - `&self.prog_settings.termios` points to a valid, initialized struct
+            //   (guaranteed by `is_saved() == true`)
+            // - `TCSANOW` applies changes immediately
             let result = unsafe {
                 libc::tcsetattr(self.input_fd, libc::TCSANOW, &self.prog_settings.termios)
             };
@@ -922,6 +1016,11 @@ impl Terminal {
     /// Restore the saved shell terminal settings.
     pub fn restore_shell_mode(&mut self) -> Result<()> {
         if self.shell_settings.is_saved() {
+            // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+            // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+            // - `&self.shell_settings.termios` points to a valid, initialized struct
+            //   (guaranteed by `is_saved() == true`)
+            // - `TCSANOW` applies changes immediately
             let result = unsafe {
                 libc::tcsetattr(self.input_fd, libc::TCSANOW, &self.shell_settings.termios)
             };
@@ -1005,6 +1104,10 @@ impl Terminal {
             new_settings.c_lflag |= libc::NOFLSH;
         }
 
+        // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+        // - `&new_settings` points to a valid `libc::termios` struct (copied from `self.current`)
+        // - `TCSANOW` applies changes immediately
         let result = unsafe { libc::tcsetattr(self.input_fd, libc::TCSANOW, &new_settings) };
         if result == 0 {
             self.current = new_settings;
@@ -1033,6 +1136,10 @@ impl Terminal {
             new_settings.c_iflag |= libc::ISTRIP;
         }
 
+        // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+        // - `&new_settings` points to a valid `libc::termios` struct (copied from `self.current`)
+        // - `TCSANOW` applies changes immediately
         let result = unsafe { libc::tcsetattr(self.input_fd, libc::TCSANOW, &new_settings) };
         if result == 0 {
             self.current = new_settings;
@@ -1071,6 +1178,10 @@ impl Terminal {
             new_settings.c_lflag |= libc::NOFLSH;
         }
 
+        // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+        // - `&new_settings` points to a valid `libc::termios` struct (copied from `self.current`)
+        // - `TCSANOW` applies changes immediately
         let result = unsafe { libc::tcsetattr(self.input_fd, libc::TCSANOW, &new_settings) };
         if result == 0 {
             self.current = new_settings;
@@ -1113,8 +1224,16 @@ impl Drop for Terminal {
 /// This uses cfgetospeed() to get the actual output speed from the terminal.
 /// Returns the baud rate as an integer (e.g., 9600, 38400, 115200).
 pub fn baudrate() -> i32 {
-    // Try to get the actual baud rate from the terminal
-    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `libc::termios` is zero-initialized, which is safe for this struct.
+    // `tcgetattr` will fully initialize it on success.
+    let mut termios = unsafe {
+        let t = MaybeUninit::<libc::termios>::zeroed();
+        t.assume_init()
+    };
+
+    // SAFETY: `tcgetattr` reads terminal attributes from stdin.
+    // - `STDIN_FILENO` is always a valid file descriptor
+    // - `&mut termios` is a valid pointer to a `libc::termios` struct
     let result = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut termios) };
 
     if result != 0 {
@@ -1122,6 +1241,8 @@ pub fn baudrate() -> i32 {
         return 38400;
     }
 
+    // SAFETY: `cfgetospeed` reads the output speed from a valid termios struct.
+    // The termios struct was successfully initialized by `tcgetattr` above.
     let ospeed = unsafe { libc::cfgetospeed(&termios) };
 
     // Convert speed_t constant to actual baud rate
