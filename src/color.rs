@@ -273,11 +273,12 @@ impl ColorManager {
         }
 
         // Validate colors (-1 is allowed if use_default_colors is enabled)
-        let min_color = if self.use_default_colors { -1 } else { 0 };
-        if fg < min_color || fg >= self.num_colors as ColorT {
+        // Use i32 comparison to avoid overflow when num_colors > i16::MAX (e.g., true color terminals)
+        let min_color: i32 = if self.use_default_colors { -1 } else { 0 };
+        if (fg as i32) < min_color || (fg as i32) >= self.num_colors {
             return Err(Error::InvalidColor(fg));
         }
-        if bg < min_color || bg >= self.num_colors as ColorT {
+        if (bg as i32) < min_color || (bg as i32) >= self.num_colors {
             return Err(Error::InvalidColor(bg));
         }
 
@@ -306,7 +307,7 @@ impl ColorManager {
         if !self.can_change {
             return Err(Error::NotSupported("terminal cannot change colors".into()));
         }
-        if color < 0 || color >= self.num_colors as ColorT {
+        if (color as i32) < 0 || (color as i32) >= self.num_colors {
             return Err(Error::InvalidColor(color));
         }
         if !(0..=RGB_MAX).contains(&r) || !(0..=RGB_MAX).contains(&g) || !(0..=RGB_MAX).contains(&b)
@@ -323,7 +324,7 @@ impl ColorManager {
         if !self.started {
             return Err(Error::ColorNotAvailable);
         }
-        if color < 0 || color >= self.num_colors as ColorT {
+        if (color as i32) < 0 || (color as i32) >= self.num_colors {
             return Err(Error::InvalidColor(color));
         }
 

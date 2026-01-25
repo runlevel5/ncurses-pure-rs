@@ -1713,15 +1713,16 @@ impl Window {
 
         #[cfg(not(feature = "wide"))]
         {
+            // Combine character with window attributes (like addch does)
             for i in 0..n {
-                self.lines[y].set(x + i, ch);
+                self.lines[y].set(x + i, ch | self.attrs);
             }
         }
         #[cfg(feature = "wide")]
         {
-            // Extract character and attributes once outside the loop
+            // Extract character and attributes, combining with window attributes
             let c = (ch & A_CHARTEXT) as u8 as char;
-            let attr = ch & !A_CHARTEXT;
+            let attr = (ch & !A_CHARTEXT) | self.attrs;
             let cchar = CCharT::from_char_attr(c, attr);
             for i in 0..n {
                 self.lines[y].set(x + i, cchar);
@@ -1740,15 +1741,16 @@ impl Window {
 
         #[cfg(not(feature = "wide"))]
         {
+            // Combine character with window attributes (like addch does)
             for i in 0..n {
-                self.lines[y + i].set(x, ch);
+                self.lines[y + i].set(x, ch | self.attrs);
             }
         }
         #[cfg(feature = "wide")]
         {
-            // Extract character and attributes once outside the loop
+            // Extract character and attributes, combining with window attributes
             let c = (ch & A_CHARTEXT) as u8 as char;
-            let attr = ch & !A_CHARTEXT;
+            let attr = (ch & !A_CHARTEXT) | self.attrs;
             let cchar = CCharT::from_char_attr(c, attr);
             for i in 0..n {
                 self.lines[y + i].set(x, cchar);
