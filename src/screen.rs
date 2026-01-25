@@ -1230,17 +1230,17 @@ impl Screen {
         let start = Instant::now();
 
         loop {
-            // Check for timeout
-            if let Some(t) = timeout {
-                if start.elapsed() >= t {
-                    return Err(Error::Timeout);
-                }
-            }
-
             // Check if input is available
             if !self.terminal.has_input() {
+                // For NoDelay mode, return immediately if no input
                 if timeout == Some(Duration::ZERO) {
                     return Err(Error::NoInput);
+                }
+                // Check for timeout (only for non-zero timeouts)
+                if let Some(t) = timeout {
+                    if start.elapsed() >= t {
+                        return Err(Error::Timeout);
+                    }
                 }
                 // Brief sleep to avoid busy waiting
                 std::thread::sleep(Duration::from_millis(1));
