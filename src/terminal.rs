@@ -3,6 +3,21 @@
 //! This module provides low-level terminal I/O functionality using
 //! POSIX termios for terminal configuration and control.
 //!
+//! # No-TTY Mode
+//!
+//! When the input/output file descriptors are not connected to a real TTY
+//! (e.g., when running via non-interactive SSH or with redirected I/O),
+//! the terminal operates in "no-TTY mode". In this mode:
+//!
+//! - Output operations (writing escape sequences) still work normally
+//! - Terminal attribute changes (raw mode, cbreak, echo) are no-ops
+//! - Input operations may return EOF or block indefinitely
+//! - The [`Terminal::is_no_tty()`] method returns `true`
+//!
+//! This behavior matches how C ncurses handles non-TTY file descriptors,
+//! allowing applications to work in pipelines or non-interactive contexts
+//! where output is still useful even if interactive input is not available.
+//!
 //! # Safety
 //!
 //! This module contains unsafe code for interfacing with POSIX terminal APIs.
@@ -59,7 +74,10 @@ impl TermSettings {
     }
 
     /// Save current terminal settings.
-    pub fn save(&mut self, fd: RawFd) -> Result<()> {
+    ///
+    /// Returns `Ok(true)` if settings were successfully saved, `Ok(false)` if the
+    /// file descriptor is not a TTY (ENOTTY), or an error for other failures.
+    pub fn save(&mut self, fd: RawFd) -> Result<bool> {
         // SAFETY: `tcgetattr` is a POSIX function that reads terminal attributes.
         // - `fd` is a valid file descriptor (checked by the caller)
         // - `&mut self.termios` is a valid pointer to a `libc::termios` struct
@@ -67,17 +85,25 @@ impl TermSettings {
         let result = unsafe { libc::tcgetattr(fd, &mut self.termios) };
         if result == 0 {
             self.saved = true;
-            Ok(())
+            Ok(true)
         } else {
-            Err(Error::SystemError(
-                io::Error::last_os_error().raw_os_error().unwrap_or(-1),
-            ))
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            if errno == libc::ENOTTY {
+                // Not a TTY - that's okay, we just can't save/restore settings
+                self.saved = false;
+                Ok(false)
+            } else {
+                Err(Error::SystemError(errno))
+            }
         }
     }
 
     /// Restore saved terminal settings.
-    pub fn restore(&self, fd: RawFd) -> Result<()> {
-        if !self.saved {
+    ///
+    /// If `no_tty` is true or no settings were saved, this is a no-op.
+    /// Also gracefully handles ENOTTY errors (returns Ok).
+    pub fn restore(&self, fd: RawFd, no_tty: bool) -> Result<()> {
+        if !self.saved || no_tty {
             return Ok(());
         }
         // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
@@ -89,9 +115,13 @@ impl TermSettings {
         if result == 0 {
             Ok(())
         } else {
-            Err(Error::SystemError(
-                io::Error::last_os_error().raw_os_error().unwrap_or(-1),
-            ))
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            if errno == libc::ENOTTY {
+                // TTY went away - that's okay
+                Ok(())
+            } else {
+                Err(Error::SystemError(errno))
+            }
         }
     }
 
@@ -108,11 +138,27 @@ impl Default for TermSettings {
 }
 
 /// Low-level terminal interface.
+///
+/// This struct provides the core terminal I/O functionality. It can operate
+/// in two modes:
+///
+/// - **Normal mode**: When connected to a real TTY, full terminal control
+///   is available including raw mode, echo control, and reliable input.
+///
+/// - **No-TTY mode**: When not connected to a TTY (e.g., via non-interactive
+///   SSH or pipes), terminal attribute changes are no-ops but output still
+///   works. Check [`is_no_tty()`](Self::is_no_tty) to detect this mode.
 pub struct Terminal {
     /// Input file descriptor.
     input_fd: RawFd,
     /// Output file descriptor.
     output_fd: RawFd,
+    /// Whether the terminal is operating without a real TTY.
+    ///
+    /// When true, `tcsetattr`/`tcgetattr` operations are skipped (they would
+    /// fail with ENOTTY anyway) and input operations may be limited.
+    /// Output via escape sequences still works normally.
+    no_tty: bool,
     /// Current terminal state.
     state: TermState,
     /// Original (shell) terminal settings.
@@ -146,6 +192,11 @@ pub struct Terminal {
 impl Terminal {
     /// Create a new terminal with the given file descriptors.
     pub fn new(input_fd: RawFd, output_fd: RawFd) -> Result<Self> {
+        Self::new_internal(input_fd, output_fd)
+    }
+
+    /// Internal constructor.
+    fn new_internal(input_fd: RawFd, output_fd: RawFd) -> Result<Self> {
         // SAFETY: `libc::termios` is a C struct that can be safely zero-initialized.
         // All fields are primitive types that have valid zero representations.
         // The struct will be properly initialized by `tcgetattr` below.
@@ -157,6 +208,7 @@ impl Terminal {
         let mut term = Self {
             input_fd,
             output_fd,
+            no_tty: false,
             state: TermState::Unknown,
             shell_settings: TermSettings::new(),
             prog_settings: TermSettings::new(),
@@ -177,15 +229,20 @@ impl Terminal {
         // - `input_fd` is provided by the caller and expected to be a valid terminal fd
         // - `&mut term.current` is a valid pointer to a `libc::termios` struct
         // - On success, the entire termios struct is initialized
-        // - On failure, we return an error before using the uninitialized struct
+        // - On ENOTTY, we enter no-TTY mode instead of failing
         let result = unsafe { libc::tcgetattr(input_fd, &mut term.current) };
         if result != 0 {
-            return Err(Error::SystemError(
-                io::Error::last_os_error().raw_os_error().unwrap_or(-1),
-            ));
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            if errno == libc::ENOTTY {
+                // Not a TTY - enter no-TTY mode
+                term.no_tty = true;
+                term.typeahead_fd = -1; // Disable typeahead checking
+            } else {
+                return Err(Error::SystemError(errno));
+            }
         }
 
-        // Save shell settings
+        // Save shell settings (will return Ok(false) in no-TTY mode)
         term.shell_settings.save(input_fd)?;
 
         // Detect terminal type
@@ -199,6 +256,10 @@ impl Terminal {
     }
 
     /// Create a terminal using stdin/stdout.
+    ///
+    /// If stdin/stdout is not a TTY (e.g., when input is redirected), the terminal
+    /// will operate in no-TTY mode where output still works but terminal attribute
+    /// changes are no-ops.
     pub fn from_stdio() -> Result<Self> {
         Self::new(libc::STDIN_FILENO, libc::STDOUT_FILENO)
     }
@@ -606,37 +667,40 @@ impl Terminal {
     pub fn enter_program_mode(&mut self) -> Result<()> {
         // Save current as program settings
         self.prog_settings.termios = self.current;
-        self.prog_settings.saved = true;
+        self.prog_settings.saved = !self.no_tty;
 
-        // Set up raw-ish mode
-        let mut new_settings = self.current;
+        if !self.no_tty {
+            // Set up raw-ish mode
+            let mut new_settings = self.current;
 
-        // Disable canonical mode and echo
-        new_settings.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+            // Disable canonical mode and echo
+            new_settings.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
 
-        // Disable input processing
-        new_settings.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IXON);
+            // Disable input processing
+            new_settings.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IXON);
 
-        // Disable output processing
-        new_settings.c_oflag &= !libc::OPOST;
+            // Disable output processing
+            new_settings.c_oflag &= !libc::OPOST;
 
-        // Set minimum characters and timeout for read
-        new_settings.c_cc[libc::VMIN] = 1;
-        new_settings.c_cc[libc::VTIME] = 0;
+            // Set minimum characters and timeout for read
+            new_settings.c_cc[libc::VMIN] = 1;
+            new_settings.c_cc[libc::VTIME] = 0;
 
-        // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
-        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
-        // - `&new_settings` points to a valid, initialized `libc::termios` struct
-        //   (copied from `self.current` which was initialized by `tcgetattr`)
-        // - `TCSANOW` applies changes immediately
-        let result = unsafe { libc::tcsetattr(self.input_fd, libc::TCSANOW, &new_settings) };
-        if result != 0 {
-            return Err(Error::SystemError(
-                io::Error::last_os_error().raw_os_error().unwrap_or(-1),
-            ));
+            // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
+            // - `self.input_fd` is a valid file descriptor (validated in `new()`)
+            // - `&new_settings` points to a valid, initialized `libc::termios` struct
+            //   (copied from `self.current` which was initialized by `tcgetattr`)
+            // - `TCSANOW` applies changes immediately
+            let result = unsafe { libc::tcsetattr(self.input_fd, libc::TCSANOW, &new_settings) };
+            if result != 0 {
+                return Err(Error::SystemError(
+                    io::Error::last_os_error().raw_os_error().unwrap_or(-1),
+                ));
+            }
+
+            self.current = new_settings;
         }
 
-        self.current = new_settings;
         self.state = TermState::Running;
 
         // Enter alternate screen buffer
@@ -659,9 +723,11 @@ impl Terminal {
         // Flush output
         self.flush()?;
 
-        // Restore shell settings
-        self.shell_settings.restore(self.input_fd)?;
-        self.current = self.shell_settings.termios;
+        // Restore shell settings (no-op in no-TTY mode)
+        self.shell_settings.restore(self.input_fd, self.no_tty)?;
+        if !self.no_tty {
+            self.current = self.shell_settings.termios;
+        }
         self.state = TermState::Suspend;
 
         Ok(())
@@ -669,6 +735,10 @@ impl Terminal {
 
     /// Set raw mode.
     pub fn raw(&mut self, enable: bool) -> Result<()> {
+        if self.no_tty {
+            return Ok(());
+        }
+
         let mut new_settings = self.current;
 
         if enable {
@@ -697,6 +767,10 @@ impl Terminal {
 
     /// Set cbreak mode.
     pub fn cbreak(&mut self, enable: bool) -> Result<()> {
+        if self.no_tty {
+            return Ok(());
+        }
+
         let mut new_settings = self.current;
 
         if enable {
@@ -725,6 +799,10 @@ impl Terminal {
 
     /// Set echo mode.
     pub fn echo(&mut self, enable: bool) -> Result<()> {
+        if self.no_tty {
+            return Ok(());
+        }
+
         let mut new_settings = self.current;
 
         if enable {
@@ -980,12 +1058,14 @@ impl Terminal {
 
     /// Save the current terminal settings as program mode.
     pub fn save_prog_mode(&mut self) -> Result<()> {
-        self.prog_settings.save(self.input_fd)
+        self.prog_settings.save(self.input_fd)?;
+        Ok(())
     }
 
     /// Save the current terminal settings as shell mode.
     pub fn save_shell_mode(&mut self) -> Result<()> {
-        self.shell_settings.save(self.input_fd)
+        self.shell_settings.save(self.input_fd)?;
+        Ok(())
     }
 
     /// Restore the saved program terminal settings.
@@ -1085,6 +1165,14 @@ impl Terminal {
     /// Get the output file descriptor.
     pub fn output_fd(&self) -> RawFd {
         self.output_fd
+    }
+
+    /// Returns true if operating in no-TTY mode.
+    ///
+    /// In no-TTY mode, terminal attribute changes are no-ops but output
+    /// (escape sequences) still works.
+    pub fn is_no_tty(&self) -> bool {
+        self.no_tty
     }
 
     // ========================================================================
