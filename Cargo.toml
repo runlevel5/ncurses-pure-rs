@@ -10,6 +10,9 @@ repository = "https://github.com/runlevel5/ncurses-pure-rs"
 keywords = ["ncurses", "curses", "terminal", "tui", "xsi"]
 categories = ["command-line-interface", "api-bindings"]
 
+[lib]
+name = "ncurses"
+
 [features]
 default = ["wide", "mouse", "ext-colors"]
 
