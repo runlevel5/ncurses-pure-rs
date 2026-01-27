@@ -1,4 +1,4 @@
-//! Wide character support for ncurses-rs.
+//! Wide character support for ncurses-pure.
 //!
 //! This module provides wide character support, allowing Unicode characters
 //! and combining characters to be displayed. This matches the X/Open XSI

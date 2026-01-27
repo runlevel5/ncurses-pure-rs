@@ -1,4 +1,4 @@
-//! Window management for ncurses-rs.
+//! Window management for ncurses-pure.
 //!
 //! This module implements the WINDOW structure and all window-related
 //! operations as defined by the X/Open XSI Curses standard.
@@ -140,7 +140,7 @@ pub struct Window {
 /// # Example
 ///
 /// ```rust,ignore
-/// use ncurses_rs::window::WindowBuilder;
+/// use ncurses::window::WindowBuilder;
 ///
 /// let win = WindowBuilder::new()
 ///     .size(24, 80)
@@ -1603,7 +1603,7 @@ impl Window {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use ncurses_rs::types::BorderChars;
+    /// use ncurses::types::BorderChars;
     ///
     /// // Use default line-drawing characters
     /// win.draw_border(BorderChars::default())?;

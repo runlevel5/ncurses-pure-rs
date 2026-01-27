@@ -1,6 +1,6 @@
 //! Key input demo showing how to handle keyboard input.
 
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;

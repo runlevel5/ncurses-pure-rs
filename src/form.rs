@@ -1,4 +1,4 @@
-//! Form library for ncurses-rs.
+//! Form library for ncurses-pure.
 //!
 //! This module provides form functionality for creating data entry forms
 //! with fields. This feature must be enabled with the `form` feature flag.

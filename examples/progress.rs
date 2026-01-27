@@ -1,7 +1,7 @@
 //! Progress bar example demonstrating text UI components.
 //!
 //! This example shows how to create animated progress bars and
-//! status indicators using ncurses-rs.
+//! status indicators using ncurses-pure.
 //!
 //! Features demonstrated:
 //! - Drawing progress bars
@@ -10,7 +10,7 @@
 //! - Box drawing characters
 //! - Color pairs for status indication
 
-use ncurses_rs::*;
+use ncurses::*;
 use std::thread;
 use std::time::Duration;
 
@@ -142,7 +142,7 @@ fn draw_header(screen: &mut Screen, max_x: i32) -> Result<()> {
         screen.addch(b' ' as ChType)?;
     }
 
-    let title = " ncurses-rs Progress Demo ";
+    let title = " ncurses-pure Progress Demo ";
     let x = (max_x - title.len() as i32) / 2;
     screen.mvaddstr(0, x, title)?;
 

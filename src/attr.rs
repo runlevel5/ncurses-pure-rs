@@ -1,4 +1,4 @@
-//! Video attributes for ncurses-rs.
+//! Video attributes for ncurses-pure.
 //!
 //! This module defines text attributes like bold, underline, reverse video, etc.
 //! These match the X/Open XSI Curses standard attributes.
@@ -154,7 +154,7 @@ pub const WA_ITALIC: AttrT = A_ITALIC;
 /// # Example
 ///
 /// ```rust
-/// use ncurses_rs::attr::{color_pair, A_BOLD};
+/// use ncurses::attr::{color_pair, A_BOLD};
 ///
 /// let attr = color_pair(1) | A_BOLD;
 /// ```

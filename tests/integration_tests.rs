@@ -1,9 +1,9 @@
-//! Integration tests for ncurses-rs
+//! Integration tests for ncurses-pure
 //!
 //! These tests verify the behavior of windows, attributes, and screen operations
 //! by examining the internal state rather than actual terminal output.
 
-use ncurses_rs::*;
+use ncurses::*;
 
 /// Test window creation and basic properties
 #[test]
@@ -944,7 +944,7 @@ fn test_pad_content() {
 
 #[cfg(feature = "menu")]
 mod menu_tests {
-    use ncurses_rs::menu::*;
+    use ncurses::menu::*;
 
     /// Test menu creation with items
     #[test]
@@ -1164,7 +1164,7 @@ mod menu_tests {
 
 #[cfg(feature = "form")]
 mod form_tests {
-    use ncurses_rs::form::*;
+    use ncurses::form::*;
 
     /// Test field creation
     #[test]
@@ -1454,7 +1454,7 @@ mod form_tests {
 
 #[cfg(feature = "menu")]
 mod menu_workflow_tests {
-    use ncurses_rs::menu::*;
+    use ncurses::menu::*;
 
     /// Test complete menu creation and interaction workflow
     #[test]
@@ -1705,7 +1705,7 @@ mod menu_workflow_tests {
 
 #[cfg(feature = "form")]
 mod form_workflow_tests {
-    use ncurses_rs::form::*;
+    use ncurses::form::*;
 
     /// Test complete form creation and interaction workflow
     #[test]

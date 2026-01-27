@@ -1,4 +1,4 @@
-//! Key code definitions for ncurses-rs.
+//! Key code definitions for ncurses-pure.
 //!
 //! This module defines the key codes returned by `getch()` for special keys
 //! like function keys, arrow keys, etc. These match the X/Open XSI Curses

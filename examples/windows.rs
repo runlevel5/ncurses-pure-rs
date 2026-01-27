@@ -1,6 +1,6 @@
 //! Window management example showing how to create and use multiple windows.
 
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;
@@ -30,7 +30,7 @@ fn main() -> Result<()> {
         title_win.bkgd(attr::color_pair(1))?;
     }
     title_win.box_(0, 0)?;
-    title_win.mvaddstr(1, 2, "Title Window - ncurses-rs Multi-Window Demo")?;
+    title_win.mvaddstr(1, 2, "Title Window - ncurses-pure Multi-Window Demo")?;
 
     // Create a content window in the middle
     let content_height = max_y - 12;

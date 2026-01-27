@@ -1,4 +1,4 @@
-//! Soft function key labels for ncurses-rs.
+//! Soft function key labels for ncurses-pure.
 //!
 //! This module provides soft label key (SLK) functionality, which displays
 //! labels at the bottom of the screen for function keys. This feature must

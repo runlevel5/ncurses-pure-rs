@@ -1,12 +1,12 @@
-//! Colors demo showing the color capabilities of ncurses-rs.
+//! Colors demo showing the color capabilities of ncurses-pure.
 
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;
 
     screen.clear()?;
-    screen.mvaddstr(0, 0, "ncurses-rs Color Demo")?;
+    screen.mvaddstr(0, 0, "ncurses-pure Color Demo")?;
 
     if !screen.has_colors() {
         screen.mvaddstr(2, 0, "Your terminal does not support colors!")?;

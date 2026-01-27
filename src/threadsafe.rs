@@ -12,7 +12,7 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use ncurses_rs::threadsafe::*;
+//! use ncurses::threadsafe::*;
 //! use std::sync::Arc;
 //!
 //! // Create a thread-safe screen wrapper
@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 /// # Example
 ///
 /// ```rust,ignore
-/// use ncurses_rs::threadsafe::ThreadSafeScreen;
+/// use ncurses::threadsafe::ThreadSafeScreen;
 ///
 /// let screen = ThreadSafeScreen::new(Screen::init()?);
 ///
@@ -135,7 +135,7 @@ impl ThreadSafeScreen {
 /// # Example
 ///
 /// ```rust,ignore
-/// use ncurses_rs::threadsafe::ThreadSafeWindow;
+/// use ncurses::threadsafe::ThreadSafeWindow;
 ///
 /// let window = ThreadSafeWindow::new(Window::new(10, 40, 0, 0)?);
 ///
@@ -293,7 +293,7 @@ pub type SharedWindow = Arc<RwLock<Window>>;
 /// # Example
 ///
 /// ```rust,ignore
-/// use ncurses_rs::threadsafe::{ThreadSafeScreen, use_screen};
+/// use ncurses::threadsafe::{ThreadSafeScreen, use_screen};
 ///
 /// let screen = ThreadSafeScreen::new(Screen::init()?);
 ///
@@ -357,7 +357,7 @@ where
 /// # Example
 ///
 /// ```rust,ignore
-/// use ncurses_rs::threadsafe::{ThreadSafeWindow, use_window};
+/// use ncurses::threadsafe::{ThreadSafeWindow, use_window};
 ///
 /// let window = ThreadSafeWindow::new(Window::new(10, 40, 0, 0)?);
 ///

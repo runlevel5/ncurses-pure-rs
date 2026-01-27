@@ -1,6 +1,6 @@
-//! Simple "Hello World" example demonstrating basic ncurses-rs usage.
+//! Simple "Hello World" example demonstrating basic ncurses-pure usage.
 
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     // Initialize the screen
@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     screen.clear()?;
 
     // Display centered title
-    let title = "Welcome to ncurses-rs!";
+    let title = "Welcome to ncurses-pure!";
     let cols = screen.cols();
     let lines = screen.lines();
     let x = (cols - title.len() as i32) / 2;

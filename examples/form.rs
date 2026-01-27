@@ -10,11 +10,11 @@
 //! - Text input and editing
 //! - Field validation
 
-use ncurses_rs::*;
+use ncurses::*;
 
 #[cfg(feature = "form")]
 fn main() -> Result<()> {
-    use ncurses_rs::form::*;
+    use ncurses::form::*;
 
     let mut screen = Screen::init()?;
 
@@ -206,7 +206,7 @@ fn draw_interface(screen: &mut Screen, _max_y: i32, max_x: i32) -> Result<()> {
     }
     screen.attron(attr::A_BOLD)?;
 
-    let title = " ncurses-rs Form Demo - Registration Form ";
+    let title = " ncurses-pure Form Demo - Registration Form ";
     let x = (max_x - title.len() as i32) / 2;
     screen.mvaddstr(1, x, title)?;
 

@@ -1,4 +1,4 @@
-//! Error types for ncurses-rs.
+//! Error types for ncurses-pure.
 
 use std::fmt;
 

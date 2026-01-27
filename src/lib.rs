@@ -1,4 +1,4 @@
-//! # ncurses-rs
+//! # ncurses-pure
 //!
 //! A pure Rust implementation of the ncurses library, compliant with the
 //! X/Open XSI Curses standard.
@@ -16,7 +16,7 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use ncurses_rs::*;
+//! use ncurses::*;
 //!
 //! fn main() -> Result<()> {
 //!     let mut screen = Screen::init()?;
@@ -28,7 +28,7 @@
 //!     {
 //!         let stdscr = screen.stdscr_mut();
 //!         stdscr.keypad(true);
-//!         stdscr.addstr("Hello, ncurses-rs!")?;
+//!         stdscr.addstr("Hello, ncurses-pure!")?;
 //!         stdscr.attron(attr::A_BOLD)?;
 //!         stdscr.addstr(" (Press any key)")?;
 //!     }

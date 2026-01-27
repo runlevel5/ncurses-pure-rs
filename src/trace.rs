@@ -12,7 +12,7 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use ncurses_rs::trace::*;
+//! use ncurses::trace::*;
 //!
 //! // Enable full tracing
 //! trace(TRACE_MAXIMUM);
@@ -137,7 +137,7 @@ fn get_trace_state() -> &'static Mutex<TraceState> {
 /// # Example
 ///
 /// ```rust,ignore
-/// use ncurses_rs::trace::*;
+/// use ncurses::trace::*;
 ///
 /// // Enable call tracing and attribute tracing
 /// trace(TRACE_CALLS | TRACE_ATTRS);
@@ -182,7 +182,7 @@ pub fn curses_trace() -> u32 {
 /// # Example
 ///
 /// ```rust,ignore
-/// use ncurses_rs::trace::*;
+/// use ncurses::trace::*;
 ///
 /// trace(TRACE_CALLS);
 /// tracef("Function called with x=10, y=20");

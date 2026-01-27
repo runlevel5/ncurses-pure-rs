@@ -1,4 +1,4 @@
-//! Terminal handling for ncurses-rs.
+//! Terminal handling for ncurses-pure.
 //!
 //! This module provides low-level terminal I/O functionality using
 //! POSIX termios for terminal configuration and control.

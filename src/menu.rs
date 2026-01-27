@@ -1,4 +1,4 @@
-//! Menu library for ncurses-rs.
+//! Menu library for ncurses-pure.
 //!
 //! This module provides menu functionality for creating selectable menus
 //! with items. This feature must be enabled with the `menu` feature flag.

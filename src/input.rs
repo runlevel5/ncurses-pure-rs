@@ -1,4 +1,4 @@
-//! Input handling for ncurses-rs.
+//! Input handling for ncurses-pure.
 //!
 //! This module provides input-related functionality including keyboard
 //! input, input buffering, and terminal mode settings.

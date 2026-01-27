@@ -10,7 +10,7 @@
 //! - Modal dialogs
 //! - Keyboard handling
 
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;
@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     if screen.has_colors() {
         screen.attron(attr::color_pair(6))?;
     }
-    let goodbye = " Thanks for trying ncurses-rs! Press any key to exit. ";
+    let goodbye = " Thanks for trying ncurses-pure! Press any key to exit. ";
     let x = (screen.cols() - goodbye.len() as i32) / 2;
     screen.mvaddstr(screen.lines() - 2, x, goodbye)?;
     if screen.has_colors() {
@@ -106,7 +106,7 @@ fn draw_background(screen: &mut Screen) -> Result<()> {
     for _ in 0..max_x {
         screen.addch(b' ' as ChType)?;
     }
-    let title = " Dialog Demo - ncurses-rs ";
+    let title = " Dialog Demo - ncurses-pure ";
     screen.mvaddstr(0, (max_x - title.len() as i32) / 2, title)?;
     if screen.has_colors() {
         screen.attroff(attr::color_pair(1))?;

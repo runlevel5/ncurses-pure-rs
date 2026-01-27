@@ -1,4 +1,4 @@
-//! Panels library for ncurses-rs.
+//! Panels library for ncurses-pure.
 //!
 //! This module provides panel functionality for managing overlapping windows
 //! as a deck of cards. Panels allow easy management of window visibility

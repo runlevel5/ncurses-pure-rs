@@ -9,11 +9,11 @@
 //! - Navigating with arrow keys
 //! - Selecting items
 
-use ncurses_rs::*;
+use ncurses::*;
 
 #[cfg(feature = "menu")]
 fn main() -> Result<()> {
-    use ncurses_rs::menu::*;
+    use ncurses::menu::*;
 
     let mut screen = Screen::init()?;
 
@@ -155,7 +155,7 @@ fn draw_title(screen: &mut Screen) -> Result<()> {
     }
     screen.attron(attr::A_BOLD)?;
 
-    let title = " ncurses-rs Menu Demo ";
+    let title = " ncurses-pure Menu Demo ";
     let x = (screen.cols() - title.len() as i32) / 2;
     screen.mvaddstr(1, x, title)?;
 

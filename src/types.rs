@@ -1,4 +1,4 @@
-//! Core type definitions for ncurses-rs.
+//! Core type definitions for ncurses-pure.
 //!
 //! This module defines the fundamental types used throughout the library,
 //! matching the X/Open XSI Curses standard.
@@ -195,7 +195,7 @@ impl From<CursorVisibility> for i32 {
 /// # Example
 ///
 /// ```rust
-/// use ncurses_rs::types::BorderChars;
+/// use ncurses::types::BorderChars;
 ///
 /// // Use default box-drawing characters
 /// let border = BorderChars::default();

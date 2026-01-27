@@ -1,4 +1,4 @@
-//! Mouse support for ncurses-rs.
+//! Mouse support for ncurses-pure.
 //!
 //! This module provides mouse event handling functionality. Mouse support
 //! must be enabled with the `mouse` feature flag.

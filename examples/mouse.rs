@@ -1,4 +1,4 @@
-//! Mouse event handling example for ncurses-rs.
+//! Mouse event handling example for ncurses-pure.
 //!
 //! This example demonstrates:
 //! - Enabling mouse support
@@ -9,11 +9,11 @@
 //! Note: Mouse support requires a terminal that supports mouse events
 //! (e.g., xterm, iTerm2, gnome-terminal).
 
-use ncurses_rs::*;
+use ncurses::*;
 
 #[cfg(feature = "mouse")]
 fn main() -> Result<()> {
-    use ncurses_rs::mouse::*;
+    use ncurses::mouse::*;
 
     let mut screen = Screen::init()?;
 
@@ -146,7 +146,7 @@ fn draw_interface(screen: &mut Screen, max_y: i32, max_x: i32) -> Result<()> {
         screen.attron(attr::color_pair(1))?;
     }
     screen.attron(attr::A_BOLD)?;
-    let title = " ncurses-rs Mouse Demo ";
+    let title = " ncurses-pure Mouse Demo ";
     let title_x = (max_x - title.len() as i32) / 2;
     screen.mvaddstr(0, title_x, title)?;
     screen.attroff(attr::A_BOLD)?;

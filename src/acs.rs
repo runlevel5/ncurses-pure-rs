@@ -1,4 +1,4 @@
-//! ACS (Alternate Character Set) characters for ncurses-rs.
+//! ACS (Alternate Character Set) characters for ncurses-pure.
 //!
 //! This module provides Unicode box-drawing characters as alternatives to
 //! the traditional VT100 line-drawing characters. Modern terminals support

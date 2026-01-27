@@ -1,4 +1,4 @@
-//! Screen management for ncurses-rs.
+//! Screen management for ncurses-pure.
 //!
 //! This module implements the `Screen` structure, which is the main entry point
 //! for using ncurses. It manages the terminal, windows, colors, and input/output.
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 /// # Example
 ///
 /// ```rust,no_run
-/// use ncurses_rs::*;
+/// use ncurses::*;
 ///
 /// fn main() -> Result<()> {
 ///     let mut screen = Screen::init()?;
@@ -654,8 +654,8 @@ impl Screen {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use ncurses_rs::*;
-    /// use ncurses_rs::mouse::*;
+    /// use ncurses::*;
+    /// use ncurses::mouse::*;
     ///
     /// # fn main() -> Result<()> {
     /// let mut screen = Screen::init()?;
@@ -743,7 +743,7 @@ impl Screen {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use ncurses_rs::types::CursorVisibility;
+    /// use ncurses::types::CursorVisibility;
     ///
     /// // Hide the cursor
     /// let old = screen.curs_set(CursorVisibility::Invisible)?;
@@ -4659,7 +4659,7 @@ struct RipoffSpec {
 /// # Example
 ///
 /// ```rust,ignore
-/// use ncurses_rs::screen::*;
+/// use ncurses::screen::*;
 ///
 /// let screen = Screen::init()?;
 /// // After init, LINES() and COLS() return the screen dimensions
@@ -4705,7 +4705,7 @@ pub mod globals {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use ncurses_rs::screen::globals::use_env;
+    /// use ncurses::screen::globals::use_env;
     ///
     /// // Don't use LINES/COLUMNS environment variables
     /// use_env(false);
@@ -4732,7 +4732,7 @@ pub mod globals {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use ncurses_rs::screen::globals::use_tioctl;
+    /// use ncurses::screen::globals::use_tioctl;
     ///
     /// // Don't use ioctl for size detection
     /// use_tioctl(false);
@@ -4770,7 +4770,7 @@ pub mod globals {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use ncurses_rs::screen::globals::ripoffline;
+    /// use ncurses::screen::globals::ripoffline;
     ///
     /// // Reserve a line at the top for a header
     /// ripoffline(1, None)?;
@@ -4783,7 +4783,7 @@ pub mod globals {
     ///
     /// # Note
     ///
-    /// In ncurses-rs, the callback argument is optional and mostly for API
+    /// In ncurses-pure, the callback argument is optional and mostly for API
     /// compatibility. The recommended pattern is to create your own windows
     /// after initialization for header/footer lines.
     pub fn ripoffline(line: i32, init: Option<fn(&mut Window, i32) -> i32>) -> Result<()> {
@@ -5067,7 +5067,7 @@ where
 
 /// Initialize curses and return the standard screen.
 ///
-/// This is the traditional ncurses initialization function. In ncurses-rs,
+/// This is the traditional ncurses initialization function. In ncurses-pure,
 /// it's an alias for `Screen::init()`.
 ///
 /// For new code, prefer using `Screen::init()` directly.
@@ -5096,7 +5096,7 @@ pub fn newterm(_type: Option<&str>, _outf: Option<()>, _inf: Option<()>) -> Resu
 
 /// Set the current terminal (screen).
 ///
-/// In ncurses-rs, there is no global current screen, so this is a no-op stub.
+/// In ncurses-pure, there is no global current screen, so this is a no-op stub.
 /// Each Screen instance manages its own state.
 ///
 /// # Arguments
@@ -5113,7 +5113,7 @@ pub fn set_term(_new: &Screen) -> Result<()> {
 
 /// Delete a screen.
 ///
-/// In ncurses-rs, screens are automatically cleaned up when dropped.
+/// In ncurses-pure, screens are automatically cleaned up when dropped.
 /// This function is a no-op stub for API compatibility.
 ///
 /// # Arguments
@@ -5125,7 +5125,7 @@ pub fn delscreen(_sp: Screen) {
 
 /// Delete a window.
 ///
-/// In ncurses-rs, windows are automatically cleaned up when dropped.
+/// In ncurses-pure, windows are automatically cleaned up when dropped.
 /// This function is provided for API compatibility.
 ///
 /// # Arguments
@@ -5137,10 +5137,10 @@ pub fn delwin(_win: Window) {
 
 /// Get the ncurses version string.
 ///
-/// Returns the version of ncurses-rs.
+/// Returns the version of ncurses-pure.
 #[must_use]
 pub fn curses_version() -> &'static str {
-    concat!("ncurses-rs ", env!("CARGO_PKG_VERSION"))
+    concat!("ncurses-pure ", env!("CARGO_PKG_VERSION"))
 }
 
 /// Get terminal attributes.

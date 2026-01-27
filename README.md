@@ -1,10 +1,10 @@
-# ncurses-rs
+# ncurses-pure
 
 A **pure Rust implementation** of the ncurses library, providing full API compatibility with **ncurses 6.6** while following the X/Open XSI Curses standard.
 
 ## Overview
 
-ncurses-rs provides terminal UI capabilities without requiring any C dependencies. It's designed as a drop-in replacement for C ncurses with an idiomatic Rust API.
+ncurses-pure provides terminal UI capabilities without requiring any C dependencies. It's designed as a drop-in replacement for C ncurses with an idiomatic Rust API.
 
 ### Key Features
 
@@ -25,7 +25,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ncurses-rs = { git = "https://github.com/runlevel5/ncurses-pure-rust.git" }
+ncurses-pure = { git = "https://github.com/runlevel5/ncurses-pure-rust.git" }
 ```
 
 ### Feature Flags
@@ -45,14 +45,14 @@ Enable specific features:
 
 ```toml
 [dependencies]
-ncurses-rs = { git = "https://github.com/runlevel5/ncurses-pure-rust.git", features = ["panels", "menu"] }
+ncurses-pure = { git = "https://github.com/runlevel5/ncurses-pure-rust.git", features = ["panels", "menu"] }
 ```
 
 Or enable all features:
 
 ```toml
 [dependencies]
-ncurses-rs = { git = "https://github.com/runlevel5/ncurses-pure-rust.git", features = ["full"] }
+ncurses-pure = { git = "https://github.com/runlevel5/ncurses-pure-rust.git", features = ["full"] }
 ```
 
 ## Quick Start
@@ -60,14 +60,14 @@ ncurses-rs = { git = "https://github.com/runlevel5/ncurses-pure-rust.git", featu
 ### Hello World
 
 ```rust
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     // Initialize the screen
     let mut screen = Screen::init()?;
     
     // Print a message
-    screen.addstr("Hello, ncurses-rs!")?;
+    screen.addstr("Hello, ncurses-pure!")?;
     screen.addstr("\nPress any key to exit...")?;
     
     // Refresh to show output
@@ -84,7 +84,7 @@ fn main() -> Result<()> {
 ### Using Colors
 
 ```rust
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
 ### Multiple Windows
 
 ```rust
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;
@@ -144,7 +144,7 @@ fn main() -> Result<()> {
 ### Handling Keyboard Input
 
 ```rust
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;
@@ -179,7 +179,7 @@ fn main() -> Result<()> {
 ### Mouse Support
 
 ```rust
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;
@@ -214,8 +214,8 @@ fn main() -> Result<()> {
 ### Using Panels
 
 ```rust
-use ncurses_rs::*;
-use ncurses_rs::panels::*;
+use ncurses::*;
+use ncurses::panels::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;
@@ -290,7 +290,7 @@ fn main() -> Result<()> {
 ### Attribute Constants
 
 ```rust
-use ncurses_rs::attr::*;
+use ncurses::attr::*;
 
 A_NORMAL      // Normal display
 A_STANDOUT    // Best highlighting mode
@@ -306,7 +306,7 @@ A_INVIS       // Invisible text
 ### Color Constants
 
 ```rust
-use ncurses_rs::*;
+use ncurses::*;
 
 COLOR_BLACK   // 0
 COLOR_RED     // 1
@@ -321,7 +321,7 @@ COLOR_WHITE   // 7
 ### Key Constants
 
 ```rust
-use ncurses_rs::key::*;
+use ncurses::key::*;
 
 KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT  // Arrow keys
 KEY_HOME, KEY_END                       // Navigation
@@ -355,14 +355,14 @@ cargo run --example panels --features panels  # Panels demo
 
 ## API Styles
 
-ncurses-rs provides **two API styles** to accommodate different use cases:
+ncurses-pure provides **two API styles** to accommodate different use cases:
 
 ### Idiomatic Rust API (Recommended)
 
 The recommended approach uses methods on `Screen`, `Window`, `Menu`, `Form`, and `Panel` structs:
 
 ```rust
-use ncurses_rs::*;
+use ncurses::*;
 
 fn main() -> Result<()> {
     let mut screen = Screen::init()?;
@@ -386,12 +386,12 @@ This approach provides:
 
 ### ncurses-Compatible Free Functions
 
-For easier porting of existing C code, ncurses-rs also provides **free functions** that match the traditional ncurses C API signatures:
+For easier porting of existing C code, ncurses-pure also provides **free functions** that match the traditional ncurses C API signatures:
 
 ```rust
-use ncurses_rs::*;
-use ncurses_rs::menu::*;  // Menu free functions
-use ncurses_rs::form::*;  // Form free functions
+use ncurses::*;
+use ncurses::menu::*;  // Menu free functions
+use ncurses::form::*;  // Form free functions
 
 // These match the C ncurses API:
 let menu = new_menu(items);
@@ -408,7 +408,7 @@ let fields = form_fields(&form);
 
 ## Compatibility
 
-ncurses-rs provides API compatibility with **ncurses 6.6**, including:
+ncurses-pure provides API compatibility with **ncurses 6.6**, including:
 
 - **Core curses functions** - Window management, input/output, attributes, colors
 - **Wide character support** - Full Unicode via `cchar_t` equivalents

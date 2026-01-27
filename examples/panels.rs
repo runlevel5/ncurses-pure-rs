@@ -9,11 +9,11 @@
 //! - Showing and hiding panels
 //! - Updating panels for display
 
-use ncurses_rs::*;
+use ncurses::*;
 
 #[cfg(feature = "panels")]
 fn main() -> Result<()> {
-    use ncurses_rs::panels::*;
+    use ncurses::panels::*;
 
     let mut screen = Screen::init()?;
 
@@ -211,7 +211,7 @@ fn update_all(screen: &mut Screen, deck: &panels::PanelDeck) -> Result<()> {
 
     // Draw title
     screen.attron(attr::A_BOLD)?;
-    screen.mvaddstr(0, 2, "ncurses-rs Panels Demo")?;
+    screen.mvaddstr(0, 2, "ncurses-pure Panels Demo")?;
     screen.attroff(attr::A_BOLD)?;
 
     screen.refresh()?;

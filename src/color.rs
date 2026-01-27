@@ -1,4 +1,4 @@
-//! Color support for ncurses-rs.
+//! Color support for ncurses-pure.
 //!
 //! This module provides color handling functionality matching the X/Open
 //! XSI Curses standard. Colors are organized into pairs (foreground/background)
