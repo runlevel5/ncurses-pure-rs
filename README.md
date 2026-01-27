@@ -25,7 +25,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ncurses-pure = { git = "https://github.com/runlevel5/ncurses-pure-rust.git" }
+ncurses-pure = { git = "https://github.com/runlevel5/ncurses-pure-rs.git" }
 ```
 
 ### Feature Flags
@@ -45,14 +45,14 @@ Enable specific features:
 
 ```toml
 [dependencies]
-ncurses-pure = { git = "https://github.com/runlevel5/ncurses-pure-rust.git", features = ["panels", "menu"] }
+ncurses-pure = { git = "https://github.com/runlevel5/ncurses-pure-rs.git", features = ["panels", "menu"] }
 ```
 
 Or enable all features:
 
 ```toml
 [dependencies]
-ncurses-pure = { git = "https://github.com/runlevel5/ncurses-pure-rust.git", features = ["full"] }
+ncurses-pure = { git = "https://github.com/runlevel5/ncurses-pure-rs.git", features = ["full"] }
 ```
 
 ## Quick Start

@@ -6,7 +6,7 @@ authors = ["Trung Le"]
 description = "A pure Rust implementation of the ncurses library, XSI Curses compliant"
 rust-version = "1.93.0"
 license = "MIT"
-repository = "https://github.com/runlevel5/ncurses-pure-rust"
+repository = "https://github.com/runlevel5/ncurses-pure-rs"
 keywords = ["ncurses", "curses", "terminal", "tui", "xsi"]
 categories = ["command-line-interface", "api-bindings"]
 
