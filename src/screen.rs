@@ -1348,8 +1348,10 @@ impl Screen {
                 EscapeMatch::None => {
                     // No match - return ESC and push rest to buffer
                     let input = self.escape_parser.current_input();
-                    for &b in &input[1..] {
-                        self.input_buffer.push(b as i32);
+                    if input.len() > 1 {
+                        for &b in &input[1..] {
+                            self.input_buffer.push(b as i32);
+                        }
                     }
                     self.input_buffer.push(byte as i32);
                     return Ok(0x1b);
