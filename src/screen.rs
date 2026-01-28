@@ -1346,13 +1346,14 @@ impl Screen {
                     return Ok(key);
                 }
                 EscapeMatch::None => {
-                    // No match - return ESC and push rest of sequence_buf to buffer
-                    // Note: We use sequence_buf here because the parser clears its
-                    // internal state when returning None, making current_input() empty.
-                    // sequence_buf[0] is ESC which we return, so push [1..] to buffer.
-                    for &b in &sequence_buf[1..] {
-                        self.input_buffer.push(b as i32);
+                    // No match - return ESC and push rest to buffer
+                    let input = self.escape_parser.current_input();
+                    if input.len() > 1 {
+                        for &b in &input[1..] {
+                            self.input_buffer.push(b as i32);
+                        }
                     }
+                    self.input_buffer.push(byte as i32);
                     return Ok(0x1b);
                 }
                 EscapeMatch::Partial => {
