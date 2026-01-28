@@ -686,20 +686,6 @@ impl Terminal {
             new_settings.c_cc[libc::VMIN] = 1;
             new_settings.c_cc[libc::VTIME] = 0;
 
-            // Disable special characters that could cause signals or suspend
-            // VDSUSP (Ctrl+Y on macOS/BSD) causes delayed suspend even with ISIG disabled
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "freebsd",
-                target_os = "dragonfly",
-                target_os = "openbsd",
-                target_os = "netbsd"
-            ))]
-            {
-                new_settings.c_cc[libc::VDSUSP] = 0;
-            }
-
             // SAFETY: `tcsetattr` is a POSIX function that sets terminal attributes.
             // - `self.input_fd` is a valid file descriptor (validated in `new()`)
             // - `&new_settings` points to a valid, initialized `libc::termios` struct
