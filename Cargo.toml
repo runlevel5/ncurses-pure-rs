@@ -51,11 +51,10 @@ sp-funcs = []
 trace = []
 
 [dependencies]
-libc = "0.2"
-bitflags = "2.4"
-unicode-width = "0.1"
-thiserror = "1.0"
-regex = { version = "1.10", optional = true }
+libc = "0.2.191"
+bitflags = "2.13"
+unicode-width = "0.2"
+regex = { version = "1.13", optional = true }
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.27"
