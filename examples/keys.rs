@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             k if k == key::KEY_IC => "KEY_IC (Insert)".to_string(),
             k if k == key::KEY_ENTER => "KEY_ENTER".to_string(),
             // Function keys
-            k if k >= key::KEY_F0 + 1 && k <= key::KEY_F0 + 12 => {
+            k if (key::KEY_F0 + 1..=key::KEY_F0 + 12).contains(&k) => {
                 format!("KEY_F{}", k - key::KEY_F0)
             }
             // Escape

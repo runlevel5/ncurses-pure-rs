@@ -85,8 +85,8 @@ pub use color::*;
 pub use error::{Error, Result};
 pub use input::*;
 pub use key::*;
-pub use screen::globals::{COLS, LINES};
 pub use screen::Screen;
+pub use screen::globals::{COLS, LINES};
 pub use types::*;
 pub use window::Window;
 
@@ -97,7 +97,7 @@ pub use mouse::*;
 pub use wide::*;
 
 /// The ncurses version string
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// ncurses major version
 pub const VERSION_MAJOR: u32 = 0;
@@ -106,4 +106,4 @@ pub const VERSION_MAJOR: u32 = 0;
 pub const VERSION_MINOR: u32 = 1;
 
 /// ncurses patch version
-pub const VERSION_PATCH: u32 = 0;
+pub const VERSION_PATCH: u32 = 1;

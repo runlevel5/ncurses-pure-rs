@@ -24,8 +24,8 @@
 //! let attr_str = traceattr(attr::A_BOLD | attr::A_UNDERLINE);
 //! ```
 
-use crate::types::{AttrT, ChType};
 use crate::Window;
+use crate::types::{AttrT, ChType};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::Mutex;
@@ -549,8 +549,8 @@ mod tests {
     #[test]
     fn test_trace_levels() {
         assert_eq!(TRACE_DISABLE, 0);
-        assert!(TRACE_MAXIMUM > TRACE_CALLS);
-        assert!((TRACE_ORDINARY & TRACE_UPDATE) != 0);
+        const { assert!(TRACE_MAXIMUM > TRACE_CALLS) };
+        const { assert!((TRACE_ORDINARY & TRACE_UPDATE) != 0) };
     }
 
     #[test]

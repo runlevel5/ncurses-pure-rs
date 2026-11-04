@@ -82,10 +82,10 @@ fn main() -> Result<()> {
 
             // Check for 'q' to quit (nodelay mode returns ERR if no input)
             let ch = screen.getch();
-            if let Ok(ch) = ch {
-                if ch == b'q' as i32 || ch == b'Q' as i32 {
-                    return Ok(());
-                }
+            if let Ok(ch) = ch
+                && (ch == b'q' as i32 || ch == b'Q' as i32)
+            {
+                return Ok(());
             }
 
             thread::sleep(delay);

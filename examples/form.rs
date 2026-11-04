@@ -10,6 +10,7 @@
 //! - Text input and editing
 //! - Field validation
 
+#[cfg(feature = "form")]
 use ncurses::*;
 
 #[cfg(feature = "form")]
@@ -158,7 +159,7 @@ fn main() -> Result<()> {
             }
 
             // Ctrl+C or Escape to clear current field
-            k if k == 27 => {
+            27 => {
                 form.driver(REQ_CLR_FIELD)?;
             }
 
@@ -171,7 +172,7 @@ fn main() -> Result<()> {
             }
 
             // q/Q with Ctrl to quit
-            k if k == 17 => {
+            17 => {
                 // Ctrl+Q
                 break;
             }
@@ -182,7 +183,7 @@ fn main() -> Result<()> {
             }
 
             // Printable characters
-            k if k >= 0x20 && k < 0x7f => {
+            k if (0x20..0x7f).contains(&k) => {
                 form.driver(k)?;
             }
 
@@ -287,13 +288,7 @@ fn draw_form_fields(
             // Draw field background
             for h in 0..height {
                 screen.mv(row + h, field_col)?;
-                let actual_width = if i == 3 {
-                    10
-                } else if i == 4 {
-                    field_width
-                } else {
-                    field_width
-                };
+                let actual_width = if i == 3 { 10 } else { field_width };
                 for _ in 0..actual_width {
                     screen.addch(b' ' as ChType)?;
                 }

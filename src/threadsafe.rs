@@ -28,9 +28,9 @@
 //! });
 //! ```
 
+use crate::Result;
 use crate::screen::Screen;
 use crate::window::Window;
-use crate::Result;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // ============================================================================

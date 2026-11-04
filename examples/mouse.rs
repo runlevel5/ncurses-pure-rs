@@ -125,10 +125,8 @@ fn main() -> Result<()> {
                     last_x -= 1;
                 }
             }
-            k if k == key::KEY_RIGHT => {
-                if last_x < max_x - 1 {
-                    last_x += 1;
-                }
+            k if k == key::KEY_RIGHT && last_x < max_x - 1 => {
+                last_x += 1;
             }
             _ => {}
         }

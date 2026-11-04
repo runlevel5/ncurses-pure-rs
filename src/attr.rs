@@ -275,8 +275,8 @@ mod tests {
     fn test_attribute_bits() {
         assert_eq!(A_NORMAL, 0);
         assert_eq!(A_CHARTEXT, 0xFF);
-        assert!(A_STANDOUT > A_CHARTEXT);
-        assert!(A_BOLD > A_STANDOUT);
+        const { assert!(A_STANDOUT > A_CHARTEXT) };
+        const { assert!(A_BOLD > A_STANDOUT) };
     }
 
     #[test]

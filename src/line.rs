@@ -3,7 +3,7 @@
 //! This module defines the internal representation of a line of window
 //! content, including change tracking for efficient refresh.
 
-use crate::types::{NcursesSize, NEWINDEX, NOCHANGE};
+use crate::types::{NEWINDEX, NOCHANGE, NcursesSize};
 
 #[cfg(feature = "wide")]
 use crate::wide::CCharT;

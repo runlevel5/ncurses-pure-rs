@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::input::{EscapeMatch, EscapeParser, InputBuffer, InputMode};
 use crate::key::KEY_MOUSE;
 #[cfg(feature = "mouse")]
-use crate::mouse::{is_mouse_prefix, parse_sgr_mouse, MouseEvent, MouseProtocol, MouseState};
+use crate::mouse::{MouseEvent, MouseProtocol, MouseState, is_mouse_prefix, parse_sgr_mouse};
 #[cfg(feature = "slk")]
 use crate::slk::{SlkFormat, SlkState};
 use crate::terminal::{InputWait, TermState, Terminal};
@@ -808,18 +808,17 @@ impl Screen {
         let maxx = self.stdscr.getmaxx();
 
         for y in 0..maxy {
-            if let Some(line) = self.stdscr.line(y as usize) {
-                if line.is_touched() {
-                    if let Some((first, last)) = line.changed_range() {
-                        for x in first..=last {
-                            if x >= maxx as usize {
-                                break;
-                            }
-                            let ch = line.get(x);
-                            if let Some(newscr_line) = self.newscr.line_mut(y as usize) {
-                                newscr_line.set(x, ch);
-                            }
-                        }
+            if let Some(line) = self.stdscr.line(y as usize)
+                && line.is_touched()
+                && let Some((first, last)) = line.changed_range()
+            {
+                for x in first..=last {
+                    if x >= maxx as usize {
+                        break;
+                    }
+                    let ch = line.get(x);
+                    if let Some(newscr_line) = self.newscr.line_mut(y as usize) {
+                        newscr_line.set(x, ch);
                     }
                 }
             }
@@ -848,20 +847,19 @@ impl Screen {
                 break;
             }
 
-            if let Some(line) = win.line(y as usize) {
-                if line.is_touched() {
-                    if let Some((first, last)) = line.changed_range() {
-                        for x in first..=last {
-                            let screen_x = (begx as usize) + x;
-                            if screen_x >= self.newscr.getmaxx() as usize {
-                                break;
-                            }
+            if let Some(line) = win.line(y as usize)
+                && line.is_touched()
+                && let Some((first, last)) = line.changed_range()
+            {
+                for x in first..=last {
+                    let screen_x = (begx as usize) + x;
+                    if screen_x >= self.newscr.getmaxx() as usize {
+                        break;
+                    }
 
-                            let ch = line.get(x);
-                            if let Some(newscr_line) = self.newscr.line_mut(screen_y) {
-                                newscr_line.set(screen_x, ch);
-                            }
-                        }
+                    let ch = line.get(x);
+                    if let Some(newscr_line) = self.newscr.line_mut(screen_y) {
+                        newscr_line.set(screen_x, ch);
                     }
                 }
             }
@@ -3419,18 +3417,17 @@ impl Screen {
                     }
                     Some('p') => {
                         // Parameter reference %p1 through %p9
-                        if let Some(digit) = chars.next() {
-                            if let Some(n) = digit.to_digit(10) {
-                                if (1..=9).contains(&n) {
-                                    let idx = (n - 1) as usize;
-                                    // Look for the format specifier
-                                    if chars.peek() == Some(&'%') {
-                                        chars.next();
-                                        if chars.peek() == Some(&'d') {
-                                            chars.next();
-                                            result.push_str(&params[idx].to_string());
-                                        }
-                                    }
+                        if let Some(digit) = chars.next()
+                            && let Some(n) = digit.to_digit(10)
+                            && (1..=9).contains(&n)
+                        {
+                            let idx = (n - 1) as usize;
+                            // Look for the format specifier
+                            if chars.peek() == Some(&'%') {
+                                chars.next();
+                                if chars.peek() == Some(&'d') {
+                                    chars.next();
+                                    result.push_str(&params[idx].to_string());
                                 }
                             }
                         }
@@ -3568,13 +3565,14 @@ impl Screen {
                     let c = u32::from_le_bytes(c_bytes);
                     let a = u32::from_le_bytes(a_bytes);
 
-                    if y < screen_lines && x < screen_cols {
-                        if let Some(line) = self.newscr.line_mut(y as usize) {
-                            let mut cchar = crate::wide::CCharT::default();
-                            cchar.chars[0] = char::from_u32(c).unwrap_or(' ');
-                            cchar.attr = a;
-                            line.set(x as usize, cchar);
-                        }
+                    if y < screen_lines
+                        && x < screen_cols
+                        && let Some(line) = self.newscr.line_mut(y as usize)
+                    {
+                        let mut cchar = crate::wide::CCharT::default();
+                        cchar.chars[0] = char::from_u32(c).unwrap_or(' ');
+                        cchar.attr = a;
+                        line.set(x as usize, cchar);
                     }
                 }
             }

@@ -3,7 +3,7 @@
 //! This module implements the WINDOW structure and all window-related
 //! operations as defined by the X/Open XSI Curses standard.
 
-use crate::attr::{self, color_pair, A_CHARTEXT, A_NORMAL};
+use crate::attr::{self, A_CHARTEXT, A_NORMAL, color_pair};
 use crate::error::{Error, Result};
 use crate::line::LineData;
 use crate::types::{AttrT, ChType, NcursesSize, WindowFlags};
@@ -2478,11 +2478,7 @@ impl Window {
     ///
     /// Returns `None` if this is not a pad.
     pub fn pad_data(&self) -> Option<&PadData> {
-        if self.is_pad() {
-            Some(&self.pad)
-        } else {
-            None
-        }
+        if self.is_pad() { Some(&self.pad) } else { None }
     }
 
     /// Get mutable pad data for this window.

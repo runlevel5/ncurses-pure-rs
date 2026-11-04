@@ -692,15 +692,15 @@ impl Terminal {
             self.columns = ws.ws_col as i32;
         } else {
             // Try environment variables
-            if let Ok(lines) = std::env::var("LINES") {
-                if let Ok(n) = lines.parse() {
-                    self.lines = n;
-                }
+            if let Ok(lines) = std::env::var("LINES")
+                && let Ok(n) = lines.parse()
+            {
+                self.lines = n;
             }
-            if let Ok(cols) = std::env::var("COLUMNS") {
-                if let Ok(n) = cols.parse() {
-                    self.columns = n;
-                }
+            if let Ok(cols) = std::env::var("COLUMNS")
+                && let Ok(n) = cols.parse()
+            {
+                self.columns = n;
             }
         }
 
@@ -1432,7 +1432,7 @@ mod tests {
 
 #[cfg(test)]
 mod poll_tests {
-    use super::{poll_readable, InputWait};
+    use super::{InputWait, poll_readable};
     use std::os::unix::io::RawFd;
     use std::time::{Duration, Instant};
 

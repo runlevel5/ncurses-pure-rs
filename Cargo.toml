@@ -1,10 +1,10 @@
 [package]
 name = "ncurses-pure"
-version = "0.1.0"
-edition = "2021"
+version = "0.1.1"
+edition = "2024"
 authors = ["Trung Le"]
 description = "A pure Rust implementation of the ncurses library, XSI Curses compliant"
-rust-version = "1.93.0"
+rust-version = "1.99.1"
 license = "MIT"
 repository = "https://github.com/runlevel5/ncurses-pure-rs"
 keywords = ["ncurses", "curses", "terminal", "tui", "xsi"]
@@ -51,11 +51,10 @@ sp-funcs = []
 trace = []
 
 [dependencies]
-libc = "0.2"
-bitflags = "2.4"
-unicode-width = "0.1"
-thiserror = "1.0"
-regex = { version = "1.10", optional = true }
+libc = "0.2.191"
+bitflags = "2.13"
+unicode-width = "0.2"
+regex = { version = "1.13", optional = true }
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.27"

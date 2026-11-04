@@ -460,11 +460,11 @@ impl Menu {
     pub fn set_pattern(&mut self, pattern: &str) -> Result<()> {
         self.pattern = pattern.to_string();
         // Find first matching item
-        if !self.pattern.is_empty() {
-            if let Some(idx) = self.find_match_forward(0) {
-                self.current = idx;
-                self.adjust_scroll();
-            }
+        if !self.pattern.is_empty()
+            && let Some(idx) = self.find_match_forward(0)
+        {
+            self.current = idx;
+            self.adjust_scroll();
         }
         Ok(())
     }

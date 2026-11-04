@@ -119,11 +119,7 @@ impl InputMode {
 
     /// Get the halfdelay timeout in tenths of a second.
     pub fn halfdelay_tenths(&self) -> i32 {
-        if self.cbreak > 1 {
-            self.cbreak - 1
-        } else {
-            0
-        }
+        if self.cbreak > 1 { self.cbreak - 1 } else { 0 }
     }
 }
 
@@ -453,10 +449,10 @@ impl EscapeParser {
         }
 
         // Check if the sequence is already defined with a different key
-        if let Some(existing) = self.root.find_sequence(sequence) {
-            if existing != keycode {
-                return false; // Already defined with different key
-            }
+        if let Some(existing) = self.root.find_sequence(sequence)
+            && existing != keycode
+        {
+            return false; // Already defined with different key
         }
 
         self.root.insert(sequence, keycode);
