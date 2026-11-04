@@ -85,8 +85,8 @@ pub use color::*;
 pub use error::{Error, Result};
 pub use input::*;
 pub use key::*;
-pub use screen::globals::{COLS, LINES};
 pub use screen::Screen;
+pub use screen::globals::{COLS, LINES};
 pub use types::*;
 pub use window::Window;
 

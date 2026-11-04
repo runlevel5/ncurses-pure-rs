@@ -371,14 +371,14 @@ fn test_instr() {
 /// Test key constants are defined
 #[test]
 fn test_key_constants() {
-    assert!(key::KEY_UP > 0x100);
-    assert!(key::KEY_DOWN > 0x100);
-    assert!(key::KEY_LEFT > 0x100);
-    assert!(key::KEY_RIGHT > 0x100);
-    assert!(key::KEY_HOME > 0x100);
-    assert!(key::KEY_END > 0x100);
-    assert!(key::KEY_BACKSPACE > 0);
-    assert!(key::KEY_DC > 0);
+    const { assert!(key::KEY_UP > 0x100) };
+    const { assert!(key::KEY_DOWN > 0x100) };
+    const { assert!(key::KEY_LEFT > 0x100) };
+    const { assert!(key::KEY_RIGHT > 0x100) };
+    const { assert!(key::KEY_HOME > 0x100) };
+    const { assert!(key::KEY_END > 0x100) };
+    const { assert!(key::KEY_BACKSPACE > 0) };
+    const { assert!(key::KEY_DC > 0) };
 }
 
 /// Test KEY_F function

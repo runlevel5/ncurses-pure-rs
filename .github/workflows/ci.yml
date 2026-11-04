@@ -126,13 +126,13 @@ jobs:
 
   # Minimum Supported Rust Version
   msrv:
-    name: MSRV (1.93.0)
+    name: MSRV (1.99.1)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # master
         with:
-          toolchain: "1.93.0"
+          toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       # Remove lock file to avoid version 4 lock file incompatibility
       # and let Cargo resolve dependencies for this Rust version

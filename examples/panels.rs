@@ -9,6 +9,7 @@
 //! - Showing and hiding panels
 //! - Updating panels for display
 
+#[cfg(feature = "panels")]
 use ncurses::*;
 
 #[cfg(feature = "panels")]
@@ -145,7 +146,7 @@ fn draw_panel(panel: &std::rc::Rc<std::cell::RefCell<panels::Panel>>, num: i32) 
     let mut win = p.window_mut();
 
     // Set color
-    if num >= 1 && num <= 4 {
+    if (1..=4).contains(&num) {
         win.bkgd(attr::color_pair(num as i16))?;
     }
 
@@ -225,7 +226,7 @@ fn update_all(screen: &mut Screen, deck: &panels::PanelDeck) -> Result<()> {
         if panel.is_visible() {
             // Get a mutable reference to window and refresh it
             let mut win = panel.window_mut();
-            screen.wrefresh(&mut *win)?;
+            screen.wrefresh(&mut win)?;
         }
     }
 

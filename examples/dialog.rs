@@ -204,9 +204,7 @@ fn show_message_dialog(
         let ch = screen.getch()?;
         match ch {
             k if k == key::KEY_LEFT || k == b'h' as i32 => {
-                if selected > 0 {
-                    selected -= 1;
-                }
+                selected = selected.saturating_sub(1);
             }
             k if k == key::KEY_RIGHT || k == b'l' as i32 => {
                 if selected < buttons.len() - 1 {
@@ -216,7 +214,7 @@ fn show_message_dialog(
             k if k == 10 || k == 13 || k == key::KEY_ENTER => {
                 break;
             }
-            k if k == 27 => {
+            27 => {
                 // ESC - select last button (usually Cancel)
                 selected = buttons.len() - 1;
                 break;
@@ -335,12 +333,9 @@ fn show_input_dialog(
             k if k == key::KEY_BACKSPACE => {
                 input.pop();
             }
-            k if (0x20..0x7f).contains(&k) => {
-                // Printable character
-                if input.len() < 100 {
-                    // Reasonable limit
-                    input.push(k as u8 as char);
-                }
+            // Printable character, with a reasonable length limit
+            k if (0x20..0x7f).contains(&k) && input.len() < 100 => {
+                input.push(k as u8 as char);
             }
             _ => {}
         }

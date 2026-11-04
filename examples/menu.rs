@@ -9,6 +9,7 @@
 //! - Navigating with arrow keys
 //! - Selecting items
 
+#[cfg(feature = "menu")]
 use ncurses::*;
 
 #[cfg(feature = "menu")]
@@ -132,7 +133,7 @@ fn main() -> Result<()> {
             }
 
             // Pass printable characters to pattern matching
-            k if k >= 0x20 && k < 0x7f => {
+            k if (0x20..0x7f).contains(&k) => {
                 menu.driver(k)?;
             }
 

@@ -1563,19 +1563,19 @@ impl Form {
 
             // Validation
             REQ_VALIDATION => {
-                if let Some(field) = self.fields.get(self.current) {
-                    if !field.borrow().validate() {
-                        return Err(Error::InvalidArgument("field validation failed".into()));
-                    }
+                if let Some(field) = self.fields.get(self.current)
+                    && !field.borrow().validate()
+                {
+                    return Err(Error::InvalidArgument("field validation failed".into()));
                 }
             }
 
             // Handle printable characters
             _ => {
-                if (0x20..0x7f).contains(&req) {
-                    if let Some(field) = self.fields.get(self.current) {
-                        field.borrow_mut().insert_char(req as u8 as char);
-                    }
+                if (0x20..0x7f).contains(&req)
+                    && let Some(field) = self.fields.get(self.current)
+                {
+                    field.borrow_mut().insert_char(req as u8 as char);
                 }
             }
         }
@@ -2286,10 +2286,10 @@ pub fn set_max_field(_field: &mut Field, _max: i32) -> Result<()> {
 /// This is the ncurses `field_index()` function.
 pub fn field_index(form: &Form, field: &Rc<RefCell<Field>>) -> Option<usize> {
     for i in 0..form.field_count() {
-        if let Some(f) = form.field(i) {
-            if Rc::ptr_eq(&f, field) {
-                return Some(i);
-            }
+        if let Some(f) = form.field(i)
+            && Rc::ptr_eq(&f, field)
+        {
+            return Some(i);
         }
     }
     None
