@@ -548,11 +548,9 @@ impl Terminal {
                     self.colors = 16777216; // 24-bit color
                     self.can_change_color = true;
                 }
-                "256" => {
-                    if self.colors < 256 {
-                        self.colors = 256;
-                        self.color_pairs = 32767;
-                    }
+                "256" if self.colors < 256 => {
+                    self.colors = 256;
+                    self.color_pairs = 32767;
                 }
                 _ => {}
             }

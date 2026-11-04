@@ -989,9 +989,9 @@ impl Window {
     pub fn addchnstr(&mut self, chstr: &[ChType], n: i32) -> Result<()> {
         let max_chars = if n < 0 { chstr.len() } else { n as usize };
         let y = self.cury as usize;
-        let mut x = self.curx as usize;
+        let first_x = self.curx as usize;
 
-        for &ch in chstr.iter().take(max_chars) {
+        for (x, &ch) in (first_x..).zip(chstr.iter().take(max_chars)) {
             if x > self.maxx as usize {
                 break;
             }
@@ -1003,7 +1003,6 @@ impl Window {
                 let attr = (ch & !A_CHARTEXT) | self.attrs;
                 self.lines[y].set(x, CCharT::from_char_attr(c, attr));
             }
-            x += 1;
         }
 
         Ok(())
@@ -1075,18 +1074,14 @@ impl Window {
     #[cfg(feature = "wide")]
     pub fn add_wchnstr(&mut self, wchstr: &[CCharT], n: i32) -> Result<()> {
         let y = self.cury as usize;
-        let mut x = self.curx as usize;
+        let first_x = self.curx as usize;
         let max_chars = if n < 0 { wchstr.len() } else { n as usize };
 
-        for (i, wch) in wchstr.iter().enumerate() {
-            if i >= max_chars {
-                break;
-            }
+        for (x, wch) in (first_x..).zip(wchstr.iter().take(max_chars)) {
             if x > self.maxx as usize {
                 break;
             }
             self.lines[y].set(x, *wch);
-            x += 1;
         }
 
         Ok(())
