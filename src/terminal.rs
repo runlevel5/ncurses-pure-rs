@@ -26,12 +26,13 @@
 //! - `libc::tcgetattr`/`libc::tcsetattr` for terminal attribute manipulation
 //! - `libc::ioctl` for terminal size queries
 //! - `libc::read`/`libc::write` for raw terminal I/O
-//! - `libc::select` for input availability checking
+//! - `libc::poll` for waiting on input availability
 
 use crate::error::{Error, Result};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::RawFd;
+use std::time::Duration;
 
 /// Terminal state flags for tracking initialization.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -134,6 +135,51 @@ impl TermSettings {
 impl Default for TermSettings {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Outcome of waiting for terminal input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputWait {
+    /// Input is available to read
+    Ready,
+    /// The timeout elapsed with no input
+    TimedOut,
+    /// A signal interrupted the wait
+    Interrupted,
+}
+
+/// Wait until `fd` is readable, the timeout elapses, or a signal arrives.
+///
+/// `None` waits indefinitely. Sub-millisecond timeouts round up to a whole
+/// millisecond so callers never spin. Errors other than `EINTR` are reported
+/// as `TimedOut`, so a bad descriptor cannot turn a blocking read into a
+/// busy loop.
+pub(crate) fn poll_readable(fd: RawFd, timeout: Option<Duration>) -> InputWait {
+    let timeout_ms: libc::c_int = match timeout {
+        None => -1,
+        Some(t) => t.as_micros().div_ceil(1000).min(libc::c_int::MAX as u128) as libc::c_int,
+    };
+
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    // SAFETY: `pollfd` is a valid, initialised array of one entry and the
+    // call only writes to its `revents` field.
+    let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+
+    if result > 0 {
+        // Readable, or hung up / errored: either way a read will not block
+        InputWait::Ready
+    } else if result == 0 {
+        InputWait::TimedOut
+    } else if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+        InputWait::Interrupted
+    } else {
+        InputWait::TimedOut
     }
 }
 
@@ -502,11 +548,9 @@ impl Terminal {
                     self.colors = 16777216; // 24-bit color
                     self.can_change_color = true;
                 }
-                "256" => {
-                    if self.colors < 256 {
-                        self.colors = 256;
-                        self.color_pairs = 32767;
-                    }
+                "256" if self.colors < 256 => {
+                    self.colors = 256;
+                    self.color_pairs = 32767;
                 }
                 _ => {}
             }
@@ -900,36 +944,13 @@ impl Terminal {
 
     /// Check if input is available.
     pub fn has_input(&self) -> bool {
-        // SAFETY: This unsafe block uses `select` to check for available input.
-        // - `libc::fd_set` is zero-initialized, which is the correct initial state
-        // - `FD_ZERO` clears the set (redundant but safe)
-        // - `FD_SET` adds our file descriptor to the set
-        // - `self.input_fd` is a valid file descriptor (validated in `new()`)
-        // - `select` is called with a zero timeout for non-blocking check
-        // - All pointers passed to `select` are valid stack-allocated variables
-        unsafe {
-            let mut fds = {
-                let f = MaybeUninit::<libc::fd_set>::zeroed();
-                f.assume_init()
-            };
-            libc::FD_ZERO(&mut fds);
-            libc::FD_SET(self.input_fd, &mut fds);
+        poll_readable(self.input_fd, Some(Duration::ZERO)) == InputWait::Ready
+    }
 
-            let mut timeout = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            };
-
-            let result = libc::select(
-                self.input_fd + 1,
-                &mut fds,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut timeout,
-            );
-
-            result > 0
-        }
+    /// Block until input is available, the timeout elapses, or a signal
+    /// interrupts the wait. `None` waits indefinitely.
+    pub fn wait_for_input(&self, timeout: Option<Duration>) -> InputWait {
+        poll_readable(self.input_fd, timeout)
     }
 
     // ========================================================================
@@ -1406,5 +1427,93 @@ mod tests {
     #[test]
     fn test_term_state() {
         assert_eq!(TermState::default(), TermState::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::{poll_readable, InputWait};
+    use std::os::unix::io::RawFd;
+    use std::time::{Duration, Instant};
+
+    fn pipe() -> (RawFd, RawFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a valid two-element array for pipe() to fill
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
+
+    fn close(fd: RawFd) {
+        // SAFETY: fd was returned by pipe() and is closed exactly once
+        unsafe { libc::close(fd) };
+    }
+
+    fn write_byte(fd: RawFd) {
+        // SAFETY: writing one byte from a valid buffer to the pipe's write end
+        assert_eq!(unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) }, 1);
+    }
+
+    #[test]
+    fn times_out_without_input_and_does_not_return_early() {
+        let (r, w) = pipe();
+        let start = Instant::now();
+        assert_eq!(
+            poll_readable(r, Some(Duration::from_millis(40))),
+            InputWait::TimedOut
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(35),
+            "returned early: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(400),
+            "took too long: {waited:?}"
+        );
+        close(r);
+        close(w);
+    }
+
+    #[test]
+    fn zero_timeout_probes_without_blocking() {
+        let (r, w) = pipe();
+        assert_eq!(poll_readable(r, Some(Duration::ZERO)), InputWait::TimedOut);
+        write_byte(w);
+        assert_eq!(poll_readable(r, Some(Duration::ZERO)), InputWait::Ready);
+        close(r);
+        close(w);
+    }
+
+    #[test]
+    fn ready_as_soon_as_data_arrives() {
+        let (r, w) = pipe();
+        write_byte(w);
+        let start = Instant::now();
+        assert_eq!(poll_readable(r, None), InputWait::Ready);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        close(r);
+        close(w);
+    }
+
+    #[test]
+    fn sub_millisecond_timeout_rounds_up() {
+        let (r, w) = pipe();
+        assert_eq!(
+            poll_readable(r, Some(Duration::from_micros(10))),
+            InputWait::TimedOut
+        );
+        close(r);
+        close(w);
+    }
+
+    #[test]
+    fn hangup_counts_as_ready_so_reads_see_eof() {
+        let (r, w) = pipe();
+        close(w);
+        assert_eq!(
+            poll_readable(r, Some(Duration::from_millis(40))),
+            InputWait::Ready
+        );
+        close(r);
     }
 }

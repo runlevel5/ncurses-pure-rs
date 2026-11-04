@@ -12,7 +12,7 @@ use crate::key::KEY_MOUSE;
 use crate::mouse::{is_mouse_prefix, parse_sgr_mouse, MouseEvent, MouseProtocol, MouseState};
 #[cfg(feature = "slk")]
 use crate::slk::{SlkFormat, SlkState};
-use crate::terminal::{TermState, Terminal};
+use crate::terminal::{InputWait, TermState, Terminal};
 use crate::types::ColorT;
 use crate::types::CursorVisibility;
 #[cfg(feature = "mouse")]
@@ -1207,12 +1207,10 @@ impl Screen {
 
     /// Internal character reading logic.
     fn getch_internal(&mut self, delay: Delay, use_keypad: bool) -> Result<i32> {
-        // Check input buffer first
         if let Some(ch) = self.input_buffer.get() {
             return Ok(ch);
         }
 
-        // Determine timeout
         let timeout = match delay {
             Delay::NoDelay => Some(Duration::ZERO),
             Delay::Blocking => {
@@ -1227,27 +1225,38 @@ impl Screen {
             Delay::Timeout(ms) => Some(Duration::from_millis(ms as u64)),
         };
 
-        let start = Instant::now();
+        // Non-blocking read: a single probe decides
+        if timeout == Some(Duration::ZERO) && !self.terminal.has_input() {
+            return Err(Error::NoInput);
+        }
+
+        let deadline = timeout.map(|t| Instant::now() + t);
 
         loop {
-            // Check if input is available
-            if !self.terminal.has_input() {
-                // For NoDelay mode, return immediately if no input
-                if timeout == Some(Duration::ZERO) {
-                    return Err(Error::NoInput);
-                }
-                // Check for timeout (only for non-zero timeouts)
-                if let Some(t) = timeout {
-                    if start.elapsed() >= t {
+            // Sleep in poll() until input arrives or the deadline passes,
+            // rather than probing every millisecond
+            let remaining = match deadline {
+                None => None,
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline && !self.terminal.has_input() {
                         return Err(Error::Timeout);
                     }
+                    Some(deadline.saturating_duration_since(now))
                 }
-                // Brief sleep to avoid busy waiting
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
+            };
+            match self.terminal.wait_for_input(remaining) {
+                InputWait::Ready => {}
+                InputWait::TimedOut => {
+                    if deadline.is_none() {
+                        // Only reachable on a poll error; do not spin forever
+                        return Err(Error::Timeout);
+                    }
+                    continue;
+                }
+                InputWait::Interrupted => return Err(Error::Interrupted),
             }
 
-            // Read a byte
             let byte = match self.terminal.read_byte()? {
                 Some(b) => b,
                 None => return Err(Error::Eof),
@@ -1302,8 +1311,10 @@ impl Screen {
             }
 
             // Check for more input
-            if !self.terminal.has_input() {
-                std::thread::sleep(Duration::from_millis(1));
+            // Wait for the rest of the sequence or the escape timeout, whichever
+            // comes first, without polling
+            let remaining = escape_timeout.saturating_sub(start.elapsed());
+            if self.terminal.wait_for_input(Some(remaining)) != InputWait::Ready {
                 continue;
             }
 

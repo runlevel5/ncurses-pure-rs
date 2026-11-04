@@ -413,10 +413,7 @@ impl EscapeParser {
     pub fn current_match(&self) -> Option<i32> {
         let mut node = &self.root;
         for &c in &self.current {
-            match node.find(c) {
-                Some(n) => node = n,
-                None => return None,
-            }
+            node = node.find(c)?;
         }
         node.key_code
     }
