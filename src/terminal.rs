@@ -502,6 +502,12 @@ impl Terminal {
                 self.can_change_color = true;
             }
 
+            "xterm-ghostty" | "ghostty" => {
+                self.colors = 256;
+                self.color_pairs = 32767;
+                self.can_change_color = false;
+            }
+
             // dumb terminal - no capabilities
             "dumb" | "unknown" | "" => {
                 self.colors = 0;
@@ -539,6 +545,21 @@ impl Terminal {
                     self.can_change_color = false;
                 }
             }
+        }
+
+        // The terminfo database knows the terminal better than the name table
+        // above: when a compiled entry exists for this TERM, its colour count
+        // wins. This is what keeps terminals with unlisted names (and no
+        // COLORTERM, as over ssh) from being treated as 8-colour.
+        if let Some(caps) = crate::terminfo::color_capabilities(&self.term_type)
+            && let Some(colors) = caps.colors
+            && colors > 0
+        {
+            self.colors = colors;
+            self.color_pairs = caps
+                .pairs
+                .filter(|p| *p > 0)
+                .unwrap_or_else(|| colors.saturating_mul(colors).min(32767));
         }
 
         // Check COLORTERM for true color support override
