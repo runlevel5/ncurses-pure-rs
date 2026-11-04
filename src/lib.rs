@@ -51,6 +51,7 @@ pub mod key;
 pub mod line;
 pub mod screen;
 pub mod terminal;
+mod terminfo;
 pub mod types;
 pub mod window;
 
