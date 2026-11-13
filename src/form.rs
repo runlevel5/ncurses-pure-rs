@@ -4,7 +4,9 @@
 //! with fields. This feature must be enabled with the `form` feature flag.
 
 use crate::error::{Error, Result};
-use crate::types::{AttrT, ChType};
+use crate::types::AttrT;
+#[cfg(not(feature = "wide"))]
+use crate::types::ChType;
 use crate::window::Window;
 
 use std::cell::RefCell;
@@ -1100,6 +1102,10 @@ impl Field {
                 };
 
                 if is_visible {
+                    // A character outside Latin-1 does not fit in a ChType
+                    #[cfg(feature = "wide")]
+                    win.add_wch(&crate::wide::CCharT::from_char_attr(display_ch, attr))?;
+                    #[cfg(not(feature = "wide"))]
                     win.addch(display_ch as ChType | attr)?;
                 }
             }
@@ -1180,7 +1186,7 @@ impl Form {
             .map(|f| Rc::new(RefCell::new(f)))
             .collect();
 
-        Self {
+        let mut form = Self {
             fields,
             current: 0,
             opts: FormOpts::empty(),
@@ -1195,7 +1201,68 @@ impl Form {
             form_term: None,
             field_init: None,
             field_term: None,
+        };
+        // Start on the first field that can take the cursor
+        form.current = form.find_selectable(0, true).unwrap_or(0);
+        form
+    }
+
+    /// Whether field `index` can be the current field: it has to be
+    /// visible and active.
+    fn is_selectable(&self, index: usize) -> bool {
+        self.fields.get(index).is_some_and(|field| {
+            field
+                .borrow()
+                .opts()
+                .contains(FieldOpts::O_VISIBLE | FieldOpts::O_ACTIVE)
+        })
+    }
+
+    /// The first field that can be the current field, looking from `start`
+    /// onwards (or backwards) and wrapping round the form.
+    fn find_selectable(&self, start: usize, forward: bool) -> Option<usize> {
+        let count = self.fields.len();
+        (0..count)
+            .map(|step| {
+                if forward {
+                    (start + step) % count
+                } else {
+                    (start + count - step) % count
+                }
+            })
+            .find(|index| self.is_selectable(*index))
+    }
+
+    /// Make the field found by [`find_selectable`](Self::find_selectable)
+    /// the current one. `offset` is where to start looking, counted from
+    /// the current field when `from_current` is set and from the first
+    /// field otherwise.
+    fn select_field(&mut self, from_current: bool, offset: usize, forward: bool) {
+        let count = self.fields.len();
+        if count == 0 {
+            return;
         }
+        let base = if from_current { self.current } else { 0 };
+        if let Some(index) = self.find_selectable((base + offset) % count, forward) {
+            self.current = index;
+        }
+    }
+
+    /// Whether `req` changes the contents of the current field.
+    fn is_edit_request(req: i32) -> bool {
+        matches!(
+            req,
+            REQ_INS_CHAR
+                | REQ_DEL_CHAR
+                | REQ_DEL_PREV
+                | REQ_NEW_LINE
+                | REQ_INS_LINE
+                | REQ_DEL_LINE
+                | REQ_DEL_WORD
+                | REQ_CLR_EOL
+                | REQ_CLR_EOF
+                | REQ_CLR_FIELD
+        ) || (0x20..0x7f).contains(&req)
     }
 
     /// Get the number of fields.
@@ -1345,6 +1412,21 @@ impl Form {
 
     /// Process a form request.
     pub fn driver(&mut self, req: i32) -> Result<()> {
+        // A field without O_EDIT can be looked at and moved around in, but
+        // not changed.
+        if Self::is_edit_request(req)
+            && let Some(field) = self.fields.get(self.current)
+            && !field.borrow().opts().contains(FieldOpts::O_EDIT)
+        {
+            return Err(Error::InvalidArgument(
+                "the current field cannot be edited".into(),
+            ));
+        }
+
+        // Fields that are hidden or not active are skipped when moving
+        // between fields.
+        let last = self.fields.len().saturating_sub(1);
+
         match req {
             // Page navigation
             REQ_NEXT_PAGE => {
@@ -1365,48 +1447,11 @@ impl Form {
             }
 
             // Field navigation
-            REQ_NEXT_FIELD => {
-                if self.current + 1 < self.fields.len() {
-                    self.current += 1;
-                } else {
-                    self.current = 0;
-                }
-            }
-            REQ_PREV_FIELD => {
-                if self.current > 0 {
-                    self.current -= 1;
-                } else {
-                    self.current = self.fields.len().saturating_sub(1);
-                }
-            }
-            REQ_FIRST_FIELD => {
-                self.current = 0;
-            }
-            REQ_LAST_FIELD => {
-                self.current = self.fields.len().saturating_sub(1);
-            }
-            REQ_SNEXT_FIELD => {
-                // Sorted next - for now same as next
-                if self.current + 1 < self.fields.len() {
-                    self.current += 1;
-                } else {
-                    self.current = 0;
-                }
-            }
-            REQ_SPREV_FIELD => {
-                // Sorted prev - for now same as prev
-                if self.current > 0 {
-                    self.current -= 1;
-                } else {
-                    self.current = self.fields.len().saturating_sub(1);
-                }
-            }
-            REQ_SFIRST_FIELD => {
-                self.current = 0;
-            }
-            REQ_SLAST_FIELD => {
-                self.current = self.fields.len().saturating_sub(1);
-            }
+            // The sorted requests are the same as the plain ones for now
+            REQ_NEXT_FIELD | REQ_SNEXT_FIELD => self.select_field(true, 1, true),
+            REQ_PREV_FIELD | REQ_SPREV_FIELD => self.select_field(true, last, false),
+            REQ_FIRST_FIELD | REQ_SFIRST_FIELD => self.select_field(false, 0, true),
+            REQ_LAST_FIELD | REQ_SLAST_FIELD => self.select_field(false, last, false),
             REQ_LEFT_FIELD | REQ_UP_FIELD => {
                 // Spatial navigation - move to field above/left
                 self.navigate_to_adjacent_field(-1, 0);
@@ -1661,7 +1706,7 @@ impl Form {
         let mut best_distance = i32::MAX;
 
         for (idx, field) in self.fields.iter().enumerate() {
-            if idx == self.current {
+            if idx == self.current || !self.is_selectable(idx) {
                 continue;
             }
             let f = field.borrow();
@@ -2822,6 +2867,121 @@ mod tests {
         field.insert_char('y');
         assert_eq!(field.buffer(), "xyab \ncd");
         assert_eq!(field.cursor_pos(), (0, 2));
+    }
+
+    /// A field with `off` removed from its default options.
+    fn field_without(row: i32, off: FieldOpts) -> Field {
+        let mut field = Field::new(1, 10, row, 0, 0, 0);
+        field.set_opts(field.opts() & !off);
+        field
+    }
+
+    #[test]
+    fn test_form_navigation_skips_fields_that_cannot_take_the_cursor() {
+        let mut form = Form::new(vec![
+            field_without(0, FieldOpts::O_ACTIVE | FieldOpts::O_EDIT), // a label
+            field_without(1, FieldOpts::empty()),
+            field_without(2, FieldOpts::O_VISIBLE),
+            field_without(3, FieldOpts::empty()),
+        ]);
+        // The form starts on the first field that can take the cursor.
+        assert_eq!(form.current_field_index(), 1);
+
+        for (request, expected) in [
+            (REQ_NEXT_FIELD, 3),
+            (REQ_NEXT_FIELD, 1),
+            (REQ_PREV_FIELD, 3),
+            (REQ_PREV_FIELD, 1),
+            (REQ_LAST_FIELD, 3),
+            (REQ_FIRST_FIELD, 1),
+            (REQ_SNEXT_FIELD, 3),
+            (REQ_SFIRST_FIELD, 1),
+            (REQ_SLAST_FIELD, 3),
+            (REQ_SPREV_FIELD, 1),
+            (REQ_DOWN_FIELD, 3),
+            (REQ_UP_FIELD, 1),
+            // Nothing to go to above the first or below the last.
+            (REQ_UP_FIELD, 1),
+        ] {
+            form.driver(request).unwrap();
+            assert_eq!(form.current_field_index(), expected, "request {request:#x}");
+        }
+    }
+
+    #[test]
+    fn test_form_navigation_with_no_field_to_go_to() {
+        let mut form = Form::new(vec![
+            field_without(0, FieldOpts::O_ACTIVE),
+            field_without(1, FieldOpts::O_ACTIVE),
+        ]);
+        assert_eq!(form.current_field_index(), 0);
+        for request in [
+            REQ_NEXT_FIELD,
+            REQ_PREV_FIELD,
+            REQ_LAST_FIELD,
+            REQ_DOWN_FIELD,
+        ] {
+            form.driver(request).unwrap();
+            assert_eq!(form.current_field_index(), 0);
+        }
+
+        // A single field goes to itself, and an empty form does nothing.
+        let mut form = Form::new(vec![field_without(0, FieldOpts::empty())]);
+        form.driver(REQ_NEXT_FIELD).unwrap();
+        form.driver(REQ_PREV_FIELD).unwrap();
+        assert_eq!(form.current_field_index(), 0);
+        let mut form = Form::new(vec![]);
+        form.driver(REQ_NEXT_FIELD).unwrap();
+        form.driver(REQ_LAST_FIELD).unwrap();
+    }
+
+    #[test]
+    fn test_form_refuses_to_edit_a_field_without_o_edit() {
+        let mut field = field_without(0, FieldOpts::O_EDIT);
+        field.set_buffer("Name:");
+        let mut form = Form::new(vec![field]);
+
+        for request in [
+            'Z' as i32,
+            REQ_CLR_FIELD,
+            REQ_CLR_EOL,
+            REQ_CLR_EOF,
+            REQ_DEL_CHAR,
+            REQ_DEL_PREV,
+            REQ_DEL_WORD,
+            REQ_DEL_LINE,
+            REQ_INS_CHAR,
+            REQ_INS_LINE,
+            REQ_NEW_LINE,
+        ] {
+            assert!(form.driver(request).is_err(), "request {request:#x}");
+            assert_eq!(form.data()[0], "Name:");
+        }
+
+        // Moving around in it is still allowed.
+        form.driver(REQ_END_LINE).unwrap();
+        assert_eq!(form.current_field().unwrap().borrow().cursor_col(), 5);
+        form.driver(REQ_NEXT_FIELD).unwrap();
+        form.driver(REQ_VALIDATION).unwrap();
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_field_renders_characters_outside_latin_1() {
+        use crate::attr::A_BOLD;
+
+        let mut field = Field::new(1, 4, 1, 2, 0, 0);
+        field.set_fore(A_BOLD);
+        field.set_buffer("日é");
+        let mut win = Window::new(3, 10, 0, 0).unwrap();
+        field.render(&mut win, true).unwrap();
+
+        win.mv(1, 2).unwrap();
+        let wide = win.in_wch();
+        assert_eq!((wide.spacing_char(), wide.attrs()), ('日', A_BOLD));
+        win.mv(1, 4).unwrap();
+        let latin = win.in_wch();
+        assert_eq!((latin.spacing_char(), latin.attrs()), ('é', A_BOLD));
     }
 
     #[test]
