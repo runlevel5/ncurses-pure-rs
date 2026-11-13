@@ -644,50 +644,49 @@ impl Field {
 
         // Handle wrap for multi-line fields
         if self.opts.contains(FieldOpts::O_WRAP) && self.height > 1 {
-            self.wrap_line_if_needed();
+            self.wrap_line(self.cursor_row);
         }
 
         self.adjust_scroll();
     }
 
-    /// Wrap the current line if it exceeds the field width.
-    fn wrap_line_if_needed(&mut self) {
+    /// Wrap line `row` if it is longer than the field is wide.
+    ///
+    /// What does not fit moves to the start of the next line, which is
+    /// wrapped in turn. The line breaks after its last space, or at the
+    /// field's width when it has none. The cursor stays with the text it was
+    /// in.
+    fn wrap_line(&mut self, row: usize) {
         let width = self.width as usize;
-        if Self::char_len(&self.buffer[self.cursor_row]) > width {
-            // Find the last space before the width limit, or just break at width
-            let line = &self.buffer[self.cursor_row];
-            let limit = Self::byte_offset(line, width);
-            let break_pos = line[..limit]
-                .rfind(' ')
-                .map(|p| p + 1) // Break after the space
-                .unwrap_or(limit);
-            // The column the break falls on
-            let break_col = Self::char_len(&line[..break_pos]);
-
-            let rest = self.buffer[self.cursor_row].split_off(break_pos);
-
-            // Move cursor to next line if it was past the break
-            if self.cursor_col >= break_col {
-                // Insert a new line or append to next
-                if self.cursor_row + 1 < self.buffer.len() {
-                    let next_line = &mut self.buffer[self.cursor_row + 1];
-                    let old_len = rest.len();
-                    *next_line = rest + next_line;
-                    self.cursor_row += 1;
-                    self.cursor_col -= break_col;
-                    // If we just added content to an existing line, it might need wrapping too
-                    if Self::char_len(next_line) > width {
-                        self.wrap_line_if_needed();
-                    }
-                    // Adjust cursor position
-                    let _ = old_len; // The position should be relative to what we moved
-                } else {
-                    self.buffer.push(rest);
-                    self.cursor_row += 1;
-                    self.cursor_col -= break_col;
-                }
-            }
+        if width == 0 || Self::char_len(&self.buffer[row]) <= width {
+            return;
         }
+
+        // Find the last space before the width limit, or just break at width
+        let line = &self.buffer[row];
+        let limit = Self::byte_offset(line, width);
+        let break_pos = line[..limit]
+            .rfind(' ')
+            .map(|p| p + 1) // Break after the space
+            .unwrap_or(limit);
+        // The column the break falls on
+        let break_col = Self::char_len(&line[..break_pos]);
+
+        let rest = self.buffer[row].split_off(break_pos);
+        if row + 1 < self.buffer.len() {
+            self.buffer[row + 1].insert_str(0, &rest);
+        } else {
+            self.buffer.push(rest);
+        }
+
+        if self.cursor_row == row && self.cursor_col >= break_col {
+            // The cursor was in the part that moved
+            self.cursor_row += 1;
+            self.cursor_col -= break_col;
+        }
+
+        // The next line may now be too long as well
+        self.wrap_line(row + 1);
     }
 
     /// Delete the character before the cursor.
@@ -2776,6 +2775,53 @@ mod tests {
         let mut win = Window::new(5, 20, 0, 0).unwrap();
         form.render_to(&mut win).unwrap();
         assert_eq!(field.borrow().cursor_row(), 1);
+    }
+
+    #[test]
+    fn test_field_wrap_keeps_the_text_pushed_off_the_line() {
+        // Inserting at the start of a full line pushes its last character
+        // onto the next line.
+        let mut field = Field::new(2, 5, 0, 0, 0, 0);
+        field.set_buffer("abcde");
+        field.insert_char('x');
+        assert_eq!(field.buffer(), "xabcd\ne");
+        assert_eq!(field.cursor_pos(), (0, 1));
+
+        // Typing at the end still takes the cursor to the next line.
+        let mut field = Field::new(2, 5, 0, 0, 0, 0);
+        field.set_buffer("abcde");
+        field.cursor_line_end();
+        field.insert_char('x');
+        assert_eq!(field.buffer(), "abcde\nx");
+        assert_eq!(field.cursor_pos(), (1, 1));
+    }
+
+    #[test]
+    fn test_field_wrap_carries_on_through_the_following_lines() {
+        let mut field = Field::new(4, 3, 0, 0, 0, 0);
+        field.set_buffer("abc\ndef\ng");
+        field.insert_char('x');
+        assert_eq!(field.buffer(), "xab\ncde\nfg");
+        assert_eq!(field.cursor_pos(), (0, 1));
+
+        // In the middle of a line.
+        let mut field = Field::new(4, 3, 0, 0, 0, 0);
+        field.set_buffer("abc\ndef");
+        field.cursor_right();
+        field.cursor_right();
+        field.insert_char('x');
+        assert_eq!(field.buffer(), "abx\ncde\nf");
+        assert_eq!(field.cursor_pos(), (1, 0));
+    }
+
+    #[test]
+    fn test_field_wrap_at_a_space_keeps_the_rest_of_the_line() {
+        let mut field = Field::new(2, 6, 0, 0, 0, 0);
+        field.set_buffer("ab cd");
+        field.insert_char('x');
+        field.insert_char('y');
+        assert_eq!(field.buffer(), "xyab \ncd");
+        assert_eq!(field.cursor_pos(), (0, 2));
     }
 
     #[test]
