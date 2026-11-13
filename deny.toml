@@ -1,0 +1,34 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+#
+# CI runs `cargo deny check bans licenses sources`. Advisories are checked by
+# the separate "Security audit" workflow (rustsec/audit-check), so they are not
+# repeated here.
+
+[graph]
+all-features = true
+
+[advisories]
+# Only used when running `cargo deny check` locally without arguments.
+yanked = "deny"
+
+[licenses]
+# Every dependency must be available under at least one of these.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Report duplicate versions of a crate without failing.
+multiple-versions = "warn"
+# A `*` version requirement would accept any future release.
+wildcards = "deny"
+
+[sources]
+# Dependencies may only come from crates.io: no git dependencies or other
+# registries, which would bypass the lockfile's checksums and review.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
