@@ -909,8 +909,33 @@ impl Screen {
         Ok(())
     }
 
+    /// Come back from `endwin`: put the terminal in curses mode again, with
+    /// the input modes that were set, and have the screen repainted.
+    fn resume(&mut self) -> Result<()> {
+        self.terminal.enter_program_mode()?;
+        if self.input_mode.raw {
+            self.terminal.raw(true)?;
+        } else if self.input_mode.cbreak != 0 {
+            self.terminal.cbreak(true)?;
+        }
+        self.terminal.echo(self.input_mode.echo)?;
+        self.terminal
+            .cursor_visible(self.cursor_visibility != CursorVisibility::Invisible)?;
+        self.initialized = true;
+
+        // The terminal shows the alternate screen afresh: repaint all of it.
+        self.stdscr.clearok(true);
+        Ok(())
+    }
+
     /// Update the physical screen from the virtual screen.
+    ///
+    /// After `endwin` this first puts the terminal back in curses mode.
     pub fn doupdate(&mut self) -> Result<()> {
+        if self.isendwin() {
+            self.resume()?;
+        }
+
         // Check if we need to clear the screen first
         let do_clear = self.stdscr.take_clear_flag();
         if do_clear {
@@ -5818,6 +5843,62 @@ mod output_tests {
         t.shown = FakeTerminal::new(2, 5);
         t.shown.fill('#');
         assert_eq!(t.refresh(), ["abcde", ""]);
+    }
+
+    #[test]
+    fn test_refresh_after_endwin_returns_to_curses_mode() {
+        let mut t = TestScreen::new(3, 10);
+        t.screen.mvaddstr(0, 0, "before").unwrap();
+        t.refresh();
+
+        t.screen.endwin().unwrap();
+        assert!(t.screen.isendwin());
+        let output = t.show();
+        assert!(output.contains("\x1b[?1049l"), "{output:?}");
+
+        // The shell has written over the terminal in the meantime.
+        t.shown.fill('#');
+        t.screen.mvaddstr(1, 0, "back").unwrap();
+        t.screen.refresh().unwrap();
+        assert!(!t.screen.isendwin());
+        let output = t.show();
+        assert!(output.contains("\x1b[?1049h"), "{output:?}");
+        assert_eq!(t.shown.rows(), ["before", "back", ""]);
+
+        // Later refreshes are ordinary ones again.
+        t.screen.mvaddstr(2, 0, "on").unwrap();
+        t.screen.refresh().unwrap();
+        let output = t.show();
+        assert!(!output.contains("\x1b[?1049h"), "{output:?}");
+        assert_eq!(t.shown.rows(), ["before", "back", "on"]);
+    }
+
+    #[test]
+    fn test_wrefresh_after_endwin_returns_to_curses_mode() {
+        let mut t = TestScreen::new(3, 10);
+        let mut win = t.screen.newwin(1, 4, 1, 1).unwrap();
+        t.screen.endwin().unwrap();
+        t.show();
+
+        win.addstr("win").unwrap();
+        t.wrefresh(&mut win);
+        assert!(!t.screen.isendwin());
+        assert_eq!(t.shown.rows(), ["", " win", ""]);
+    }
+
+    #[test]
+    fn test_returning_from_endwin_restores_the_cursor_visibility() {
+        for (visibility, sequence) in [(0, "\x1b[?25l"), (1, "\x1b[?25h")] {
+            let mut t = TestScreen::new(2, 10);
+            t.screen.curs_set(visibility).unwrap();
+            t.screen.endwin().unwrap();
+            t.show();
+
+            t.screen.refresh().unwrap();
+            let output = t.show();
+            let last = output.rfind("\x1b[?25").map(|at| &output[at..at + 6]);
+            assert_eq!(last, Some(sequence), "{output:?}");
+        }
     }
 
     #[test]
