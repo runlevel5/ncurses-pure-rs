@@ -360,11 +360,17 @@ pub struct Field {
 
 impl Field {
     /// Create a new field.
+    ///
+    /// A field is at least one row high and one column wide, and its
+    /// position and extra rows and buffers cannot be negative: arguments
+    /// outside those limits are brought inside them.
     pub fn new(height: i32, width: i32, row: i32, col: i32, offscreen: i32, nbuffers: i32) -> Self {
-        // Initialize buffer with appropriate number of lines
-        let total_rows = (height + offscreen) as usize;
-        let mut buffer = Vec::with_capacity(total_rows.max(1));
-        buffer.push(String::new());
+        let (height, width) = (height.max(1), width.max(1));
+        let (row, col) = (row.max(0), col.max(0));
+        let (offscreen, nbuffers) = (offscreen.max(0), nbuffers.max(0));
+
+        // The buffer grows as lines are added
+        let buffer = vec![String::new()];
 
         Self {
             row,
@@ -3185,6 +3191,26 @@ mod tests {
             cells(&mut win, 0, 8),
             ['<', '*', '*', '_', '_', '_', '<', '<']
         );
+    }
+
+    #[test]
+    fn test_field_dimensions_are_brought_within_limits() {
+        for (height, width) in [(-1, -5), (0, 0), (i32::MIN, i32::MIN)] {
+            let mut field = Field::new(height, width, -2, -3, -1, -1);
+            assert_eq!(field.dimensions(), (1, 1, 0, 0));
+            assert_eq!(field.offscreen(), 0);
+            assert_eq!(field.total_rows(), 1);
+
+            // It works as a field of one cell.
+            field.insert_char('a');
+            field.insert_char('b');
+            assert_eq!(field.buffer(), "a");
+            field.cursor_line_home();
+            let mut win = Window::new(2, 4, 0, 0).unwrap();
+            field.render(&mut win, true).unwrap();
+            win.mv(0, 0).unwrap();
+            assert_eq!(win.instr(2), "a ");
+        }
     }
 
     #[test]
