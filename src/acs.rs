@@ -3,7 +3,14 @@
 //! This module provides Unicode box-drawing characters as alternatives to
 //! the traditional VT100 line-drawing characters. Modern terminals support
 //! these characters directly without needing alternate character set mode.
+//!
+//! The `ACS_*` constants are `char`s. Use them directly with strings and the
+//! wide-character functions. For the functions that take a `ChType`, such as
+//! `addch`, `hline` and `border`, convert them with [`acs_char`]: a cast
+//! (`ACS_HLINE as ChType`) does not work, because only the low byte of a
+//! `ChType` holds its character.
 
+use crate::attr::A_ALTCHARSET;
 use crate::types::ChType;
 
 // ============================================================================
@@ -156,122 +163,120 @@ pub const ACS_ROUND_LRCORNER: char = '╯';
 // Helper functions
 // ============================================================================
 
-/// Convert an ACS character to a ChType with A_ALTCHARSET.
+/// The VT100 line-drawing codes and the characters they stand for.
 ///
-/// For wide character support, this returns the Unicode character directly.
-/// For non-wide mode, it returns an ASCII fallback with A_ALTCHARSET.
-#[cfg(feature = "wide")]
-pub fn acs_char(c: char) -> ChType {
-    c as ChType
-}
+/// A code with `A_ALTCHARSET` is how a `ChType` carries one of these
+/// characters: only the low byte of a `ChType` holds its character, which
+/// is too small for the Unicode value.
+const VT100_CODES: [(u8, char); 32] = [
+    (b'l', ACS_ULCORNER),
+    (b'm', ACS_LLCORNER),
+    (b'k', ACS_URCORNER),
+    (b'j', ACS_LRCORNER),
+    (b't', ACS_LTEE),
+    (b'u', ACS_RTEE),
+    (b'w', ACS_TTEE),
+    (b'v', ACS_BTEE),
+    (b'q', ACS_HLINE),
+    (b'x', ACS_VLINE),
+    (b'n', ACS_PLUS),
+    (b'o', ACS_S1),
+    (b'p', ACS_S3),
+    (b'r', ACS_S7),
+    (b's', ACS_S9),
+    (b'`', ACS_DIAMOND),
+    (b'a', ACS_CKBOARD),
+    (b'f', ACS_DEGREE),
+    (b'g', ACS_PLMINUS),
+    (b'~', ACS_BULLET),
+    (b',', ACS_LARROW),
+    (b'+', ACS_RARROW),
+    (b'.', ACS_DARROW),
+    (b'-', ACS_UARROW),
+    (b'h', ACS_BOARD),
+    (b'i', ACS_LANTERN),
+    (b'0', ACS_BLOCK),
+    (b'y', ACS_LEQUAL),
+    (b'z', ACS_GEQUAL),
+    (b'{', ACS_PI),
+    (b'|', ACS_NEQUAL),
+    (b'}', ACS_STERLING),
+];
 
-/// Convert an ACS character to a ChType.
+/// The VT100 line-drawing code for an ACS character.
 ///
-/// In non-wide mode, returns ASCII fallbacks.
-#[cfg(not(feature = "wide"))]
-pub fn acs_char(c: char) -> ChType {
-    use crate::attr::A_ALTCHARSET;
-
-    // Map Unicode characters to ASCII fallbacks with A_ALTCHARSET
-    let ascii = match c {
-        '┌' | '╔' | '┏' | '╭' => 'l',
-        '└' | '╚' | '┗' | '╰' => 'm',
-        '┐' | '╗' | '┓' | '╮' => 'k',
-        '┘' | '╝' | '┛' | '╯' => 'j',
-        '├' | '╠' | '┣' => 't',
-        '┤' | '╣' | '┫' => 'u',
-        '┬' | '╦' | '┳' => 'w',
-        '┴' | '╩' | '┻' => 'v',
-        '─' | '═' | '━' => 'q',
-        '│' | '║' | '┃' => 'x',
-        '┼' | '╬' | '╋' => 'n',
-        '◆' => '`',
-        '▒' => 'a',
-        '°' => 'f',
-        '±' => 'g',
-        '·' => '~',
-        '←' => ',',
-        '→' => '+',
-        '↓' => '.',
-        '↑' => '-',
-        '▓' => 'h',
-        '█' => '0',
-        '≤' => 'y',
-        '≥' => 'z',
-        'π' => '{',
-        '≠' => '|',
-        '£' => '}',
+/// The double, heavy and rounded variants have no code of their own and
+/// share the code of the plain character.
+fn vt100_code(c: char) -> Option<u8> {
+    let plain = match c {
+        '╔' | '┏' | '╭' => ACS_ULCORNER,
+        '╚' | '┗' | '╰' => ACS_LLCORNER,
+        '╗' | '┓' | '╮' => ACS_URCORNER,
+        '╝' | '┛' | '╯' => ACS_LRCORNER,
+        '╠' | '┣' => ACS_LTEE,
+        '╣' | '┫' => ACS_RTEE,
+        '╦' | '┳' => ACS_TTEE,
+        '╩' | '┻' => ACS_BTEE,
+        '═' | '━' => ACS_HLINE,
+        '║' | '┃' => ACS_VLINE,
+        '╬' | '╋' => ACS_PLUS,
         _ => c,
     };
-
-    (ascii as u8 as ChType) | A_ALTCHARSET
+    VT100_CODES
+        .iter()
+        .find(|(_, acs)| *acs == plain)
+        .map(|(code, _)| *code)
 }
 
-/// Get the ACS map for the current terminal.
+/// Convert an ACS character to a `ChType` for `addch`, `hline`, `border`
+/// and the other functions that take one.
 ///
-/// This returns an array of ChType values that map ACS indices to
-/// terminal-specific character codes.
+/// The result is the character's VT100 line-drawing code with
+/// `A_ALTCHARSET`, which those functions draw as the character itself.
+/// Casting the constant instead (`ACS_HLINE as ChType`) does not work:
+/// only the low byte of a `ChType` holds its character.
+///
+/// The double, heavy and rounded variants (`ACS_D_*`, `ACS_HEAVY_*`,
+/// `ACS_ROUND_*`) have no code and come out as the plain character. To draw
+/// them, use the wide-character functions with a `CCharT`.
+///
+/// A character that is not an ACS character is returned as it is when it
+/// fits in a `ChType` (U+00FF and below), and as `?` otherwise.
+pub fn acs_char(c: char) -> ChType {
+    match vt100_code(c) {
+        Some(code) => ChType::from(code) | A_ALTCHARSET,
+        None => ChType::from(u8::try_from(c).unwrap_or(b'?')),
+    }
+}
+
+/// The ACS character a VT100 line-drawing code stands for.
+///
+/// This is the reverse of [`acs_char`]: `acs_unicode(b'q')` is `ACS_HLINE`.
+pub fn acs_unicode(code: u8) -> Option<char> {
+    VT100_CODES
+        .iter()
+        .find(|(vt100, _)| *vt100 == code)
+        .map(|(_, c)| *c)
+}
+
+/// The VT100 line-drawing code, with `A_ALTCHARSET`, of a character read
+/// back from a window, if it is an ACS character.
+pub(crate) fn acs_chtype(c: char) -> Option<ChType> {
+    VT100_CODES
+        .iter()
+        .find(|(_, acs)| *acs == c)
+        .map(|(code, _)| ChType::from(*code) | A_ALTCHARSET)
+}
+
+/// Get the ACS map.
+///
+/// The entry for a VT100 line-drawing code is that code with
+/// `A_ALTCHARSET`, as [`acs_char`] returns it; the other entries are 0.
 pub fn acs_map() -> [ChType; 128] {
     let mut map = [0 as ChType; 128];
-
-    // Standard VT100 line-drawing mappings
-    // Index is the 'j' through 'z' and special characters
-
-    #[cfg(feature = "wide")]
-    {
-        // Use Unicode characters directly
-        map[b'j' as usize] = ACS_LRCORNER as ChType; // ┘
-        map[b'k' as usize] = ACS_URCORNER as ChType; // ┐
-        map[b'l' as usize] = ACS_ULCORNER as ChType; // ┌
-        map[b'm' as usize] = ACS_LLCORNER as ChType; // └
-        map[b'n' as usize] = ACS_PLUS as ChType; // ┼
-        map[b'q' as usize] = ACS_HLINE as ChType; // ─
-        map[b't' as usize] = ACS_LTEE as ChType; // ├
-        map[b'u' as usize] = ACS_RTEE as ChType; // ┤
-        map[b'v' as usize] = ACS_BTEE as ChType; // ┴
-        map[b'w' as usize] = ACS_TTEE as ChType; // ┬
-        map[b'x' as usize] = ACS_VLINE as ChType; // │
-        map[b'`' as usize] = ACS_DIAMOND as ChType; // ◆
-        map[b'a' as usize] = ACS_CKBOARD as ChType; // ▒
-        map[b'f' as usize] = ACS_DEGREE as ChType; // °
-        map[b'g' as usize] = ACS_PLMINUS as ChType; // ±
-        map[b'~' as usize] = ACS_BULLET as ChType; // ·
-        map[b',' as usize] = ACS_LARROW as ChType; // ←
-        map[b'+' as usize] = ACS_RARROW as ChType; // →
-        map[b'.' as usize] = ACS_DARROW as ChType; // ↓
-        map[b'-' as usize] = ACS_UARROW as ChType; // ↑
-        map[b'h' as usize] = ACS_BOARD as ChType; // ▓
-        map[b'0' as usize] = ACS_BLOCK as ChType; // █
+    for (code, _) in VT100_CODES {
+        map[usize::from(code)] = ChType::from(code) | A_ALTCHARSET;
     }
-
-    #[cfg(not(feature = "wide"))]
-    {
-        use crate::attr::A_ALTCHARSET;
-        // Use VT100 alternate character set codes
-        map[b'j' as usize] = (b'j' as ChType) | A_ALTCHARSET;
-        map[b'k' as usize] = (b'k' as ChType) | A_ALTCHARSET;
-        map[b'l' as usize] = (b'l' as ChType) | A_ALTCHARSET;
-        map[b'm' as usize] = (b'm' as ChType) | A_ALTCHARSET;
-        map[b'n' as usize] = (b'n' as ChType) | A_ALTCHARSET;
-        map[b'q' as usize] = (b'q' as ChType) | A_ALTCHARSET;
-        map[b't' as usize] = (b't' as ChType) | A_ALTCHARSET;
-        map[b'u' as usize] = (b'u' as ChType) | A_ALTCHARSET;
-        map[b'v' as usize] = (b'v' as ChType) | A_ALTCHARSET;
-        map[b'w' as usize] = (b'w' as ChType) | A_ALTCHARSET;
-        map[b'x' as usize] = (b'x' as ChType) | A_ALTCHARSET;
-        map[b'`' as usize] = (b'`' as ChType) | A_ALTCHARSET;
-        map[b'a' as usize] = (b'a' as ChType) | A_ALTCHARSET;
-        map[b'f' as usize] = (b'f' as ChType) | A_ALTCHARSET;
-        map[b'g' as usize] = (b'g' as ChType) | A_ALTCHARSET;
-        map[b'~' as usize] = (b'~' as ChType) | A_ALTCHARSET;
-        map[b',' as usize] = (b',' as ChType) | A_ALTCHARSET;
-        map[b'+' as usize] = (b'+' as ChType) | A_ALTCHARSET;
-        map[b'.' as usize] = (b'.' as ChType) | A_ALTCHARSET;
-        map[b'-' as usize] = (b'-' as ChType) | A_ALTCHARSET;
-        map[b'h' as usize] = (b'h' as ChType) | A_ALTCHARSET;
-        map[b'0' as usize] = (b'0' as ChType) | A_ALTCHARSET;
-    }
-
     map
 }
 
@@ -291,20 +296,95 @@ mod tests {
 
     #[test]
     fn test_acs_char() {
-        let ch = acs_char(ACS_HLINE);
-        // Just test that it returns something
-        assert!(ch != 0);
+        assert_eq!(acs_char(ACS_HLINE), ChType::from(b'q') | A_ALTCHARSET);
+        assert_eq!(acs_char(ACS_ULCORNER), ChType::from(b'l') | A_ALTCHARSET);
+        assert_eq!(acs_char(ACS_STERLING), ChType::from(b'}') | A_ALTCHARSET);
+    }
+
+    #[test]
+    fn test_acs_char_keeps_the_character_in_the_low_byte() {
+        for (code, c) in VT100_CODES {
+            let ch = acs_char(c);
+            assert_eq!(ch & crate::attr::A_CHARTEXT, ChType::from(code), "{c}");
+            assert_eq!(ch & !crate::attr::A_CHARTEXT, A_ALTCHARSET, "{c}");
+        }
+    }
+
+    #[test]
+    fn test_acs_codes_and_characters_are_distinct() {
+        for (i, (code, c)) in VT100_CODES.iter().enumerate() {
+            for (other_code, other_c) in &VT100_CODES[i + 1..] {
+                assert_ne!(code, other_code);
+                assert_ne!(c, other_c);
+            }
+            assert!(code.is_ascii_graphic());
+        }
+    }
+
+    #[test]
+    fn test_acs_unicode_reverses_acs_char() {
+        for (code, c) in VT100_CODES {
+            assert_eq!(acs_unicode(code), Some(c));
+            assert_eq!(acs_chtype(c), Some(acs_char(c)));
+        }
+        assert_eq!(acs_unicode(b'A'), None);
+        assert_eq!(acs_unicode(0), None);
+        assert_eq!(acs_chtype('A'), None);
+        assert_eq!(acs_chtype('═'), None);
+    }
+
+    #[test]
+    fn test_acs_char_variants_fall_back_to_the_plain_character() {
+        for (variants, plain) in [
+            (
+                [ACS_D_ULCORNER, ACS_HEAVY_ULCORNER, ACS_ROUND_ULCORNER],
+                ACS_ULCORNER,
+            ),
+            (
+                [ACS_D_LLCORNER, ACS_HEAVY_LLCORNER, ACS_ROUND_LLCORNER],
+                ACS_LLCORNER,
+            ),
+            (
+                [ACS_D_URCORNER, ACS_HEAVY_URCORNER, ACS_ROUND_URCORNER],
+                ACS_URCORNER,
+            ),
+            (
+                [ACS_D_LRCORNER, ACS_HEAVY_LRCORNER, ACS_ROUND_LRCORNER],
+                ACS_LRCORNER,
+            ),
+        ] {
+            for variant in variants {
+                assert_eq!(acs_char(variant), acs_char(plain), "{variant}");
+            }
+        }
+        for (double, heavy, plain) in [
+            (ACS_D_HLINE, ACS_HEAVY_HLINE, ACS_HLINE),
+            (ACS_D_VLINE, ACS_HEAVY_VLINE, ACS_VLINE),
+            (ACS_D_LTEE, ACS_HEAVY_LTEE, ACS_LTEE),
+            (ACS_D_RTEE, ACS_HEAVY_RTEE, ACS_RTEE),
+            (ACS_D_TTEE, ACS_HEAVY_TTEE, ACS_TTEE),
+            (ACS_D_BTEE, ACS_HEAVY_BTEE, ACS_BTEE),
+            (ACS_D_PLUS, ACS_HEAVY_PLUS, ACS_PLUS),
+        ] {
+            assert_eq!(acs_char(double), acs_char(plain), "{double}");
+            assert_eq!(acs_char(heavy), acs_char(plain), "{heavy}");
+        }
+    }
+
+    #[test]
+    fn test_acs_char_of_other_characters() {
+        assert_eq!(acs_char('A'), ChType::from(b'A'));
+        assert_eq!(acs_char('é'), 0xE9);
+        assert_eq!(acs_char('日'), ChType::from(b'?'));
     }
 
     #[test]
     fn test_acs_map() {
         let map = acs_map();
-        // Check that the map entries for line drawing are set
-        assert!(map[b'j' as usize] != 0);
-        assert!(map[b'k' as usize] != 0);
-        assert!(map[b'l' as usize] != 0);
-        assert!(map[b'm' as usize] != 0);
-        assert!(map[b'q' as usize] != 0);
-        assert!(map[b'x' as usize] != 0);
+        for (code, c) in VT100_CODES {
+            assert_eq!(map[usize::from(code)], acs_char(c), "{c}");
+        }
+        let set = map.iter().filter(|entry| **entry != 0).count();
+        assert_eq!(set, VT100_CODES.len());
     }
 }

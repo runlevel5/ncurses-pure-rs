@@ -5635,6 +5635,22 @@ mod output_tests {
     }
 
     #[test]
+    fn test_acs_characters_reach_the_terminal_as_line_drawing_characters() {
+        use crate::acs::*;
+
+        let mut t = TestScreen::new(3, 5);
+        t.screen.addch(acs_char(ACS_ULCORNER)).unwrap();
+        t.screen.addch(acs_char(ACS_HLINE)).unwrap();
+        t.screen.addch(acs_char(ACS_URCORNER)).unwrap();
+        t.screen.mv(1, 0).unwrap();
+        t.screen.hline(acs_char(ACS_CKBOARD), 3).unwrap();
+        t.screen.mv(2, 1).unwrap();
+        t.screen.addch(acs_char(ACS_DARROW) | attr::A_BOLD).unwrap();
+        let output_rows = t.refresh();
+        assert_eq!(output_rows, ["┌─┐", "▒▒▒", " ↓"]);
+    }
+
+    #[test]
     fn test_text_after_a_double_width_character_stays_in_its_column() {
         let mut t = TestScreen::new(2, 10);
         t.screen.mvaddstr(0, 0, "日本ab").unwrap();
