@@ -584,11 +584,19 @@ impl Field {
             self.scroll_row = self.cursor_row - visible_rows + 1;
         }
 
-        // Horizontal scrolling
+        // Horizontal scrolling: the cursor has to start inside the visible
+        // columns, which double-width characters use up twice as fast.
         if self.cursor_col < self.scroll_col {
             self.scroll_col = self.cursor_col;
-        } else if self.cursor_col >= self.scroll_col + visible_cols {
-            self.scroll_col = self.cursor_col - visible_cols + 1;
+        } else {
+            let line = self.current_line();
+            let mut scroll_col = self.scroll_col;
+            while scroll_col < self.cursor_col
+                && Self::cols_between(line, scroll_col, self.cursor_col) >= visible_cols
+            {
+                scroll_col += 1;
+            }
+            self.scroll_col = scroll_col;
         }
     }
 
@@ -612,6 +620,41 @@ impl Field {
         line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
     }
 
+    /// The screen columns a character takes: two for a double-width one.
+    fn char_cols(c: char) -> usize {
+        unicode_width::UnicodeWidthChar::width(c)
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// The screen columns `line` takes.
+    fn cols(line: &str) -> usize {
+        line.chars().map(Self::char_cols).sum()
+    }
+
+    /// The screen columns taken by the characters of `line` from index
+    /// `from` up to, not including, index `to`.
+    fn cols_between(line: &str, from: usize, to: usize) -> usize {
+        line.chars()
+            .skip(from)
+            .take(to.saturating_sub(from))
+            .map(Self::char_cols)
+            .sum()
+    }
+
+    /// The byte offset in `line` of the first character that does not fit
+    /// in `cols` screen columns, or the length of `line` when all of it fits.
+    fn byte_offset_of_cols(line: &str, cols: usize) -> usize {
+        let mut used = 0;
+        for (offset, c) in line.char_indices() {
+            used += Self::char_cols(c);
+            if used > cols {
+                return offset;
+            }
+        }
+        line.len()
+    }
+
     /// Insert a character at the cursor position.
     pub fn insert_char(&mut self, ch: char) {
         // Ensure we have enough rows
@@ -623,15 +666,16 @@ impl Field {
         if self.opts.contains(FieldOpts::O_STATIC) {
             // For single-line fields, check width
             if self.height == 1
-                && Self::char_len(&self.buffer[self.cursor_row]) >= self.width as usize
+                && Self::cols(&self.buffer[self.cursor_row]) + Self::char_cols(ch)
+                    > self.width as usize
             {
                 return;
             }
             // For multi-line fields, check total capacity
             if self.height > 1 {
-                let total_chars: usize = self.buffer.iter().map(|s| Self::char_len(s)).sum();
-                let max_chars = (self.height + self.offscreen) as usize * self.width as usize;
-                if total_chars >= max_chars {
+                let total_cols: usize = self.buffer.iter().map(|s| Self::cols(s)).sum();
+                let max_cols = (self.height + self.offscreen) as usize * self.width as usize;
+                if total_cols + Self::char_cols(ch) > max_cols {
                     return;
                 }
             }
@@ -660,13 +704,20 @@ impl Field {
     /// in.
     fn wrap_line(&mut self, row: usize) {
         let width = self.width as usize;
-        if width == 0 || Self::char_len(&self.buffer[row]) <= width {
+        if width == 0 || Self::cols(&self.buffer[row]) <= width {
             return;
         }
 
         // Find the last space before the width limit, or just break at width
         let line = &self.buffer[row];
-        let limit = Self::byte_offset(line, width);
+        let limit = match Self::byte_offset_of_cols(line, width) {
+            // Not even the first character fits: it gets a line to itself
+            0 => line.chars().next().map_or(0, char::len_utf8),
+            limit => limit,
+        };
+        if limit == line.len() {
+            return;
+        }
         let break_pos = line[..limit]
             .rfind(' ')
             .map(|p| p + 1) // Break after the space
@@ -978,14 +1029,12 @@ impl Field {
     /// top-left corner. A cursor that is scrolled out of view is reported at
     /// the nearest edge.
     fn cursor_in_window(&self) -> (i32, i32) {
-        let offset = |cursor: usize, scroll: usize, size: i32| {
-            let offset = cursor as i64 - scroll as i64;
-            offset.clamp(0, i64::from(size.max(1)) - 1) as i32
-        };
-        (
-            offset(self.cursor_row, self.scroll_row, self.height),
-            offset(self.cursor_col, self.scroll_col, self.width),
-        )
+        let clamp = |offset: i64, size: i32| offset.clamp(0, i64::from(size.max(1)) - 1) as i32;
+        // Rows count lines; columns count what the characters between the
+        // left edge and the cursor take on screen.
+        let row = self.cursor_row as i64 - self.scroll_row as i64;
+        let col = Self::cols_between(self.current_line(), self.scroll_col, self.cursor_col);
+        (clamp(row, self.height), clamp(col as i64, self.width))
     }
 
     /// Scroll field forward by n lines.
@@ -1036,13 +1085,25 @@ impl Field {
     ///
     /// The cursor moves with the text as far as its line reaches.
     pub fn scroll_hforward(&mut self, n: usize) {
-        let max_col = self
+        // The furthest any line needs scrolling for its end to be in view
+        let width = self.width as usize;
+        let max_scroll = self
             .buffer
             .iter()
-            .map(|s| Self::char_len(s))
+            .map(|line| {
+                let mut tail_cols = 0;
+                let fits = line
+                    .chars()
+                    .rev()
+                    .take_while(|c| {
+                        tail_cols += Self::char_cols(*c);
+                        tail_cols <= width
+                    })
+                    .count();
+                Self::char_len(line) - fits
+            })
             .max()
             .unwrap_or(0);
-        let max_scroll = max_col.saturating_sub(self.width as usize);
         let scroll_col = self.scroll_col.saturating_add(n).min(max_scroll);
         let moved = scroll_col.saturating_sub(self.scroll_col);
         self.scroll_col = scroll_col;
@@ -1079,28 +1140,25 @@ impl Field {
                 .map(|s| s.as_str())
                 .unwrap_or("");
 
-            // Pre-collect characters for efficient indexed access
-            let chars: Vec<char> = content.chars().collect();
-            let visible_start = self.scroll_col;
-
-            // Write characters with attribute
-            for col in 0..self.width as usize {
-                let content_col = visible_start + col;
-                let ch = if content_col < chars.len() {
-                    chars[content_col]
-                } else {
-                    self.pad
-                };
-
+            // The characters that fit in the field's columns, then padding.
+            // A double-width character takes two columns, and is left out
+            // when only one is free.
+            let width = self.width as usize;
+            let mut used = 0;
+            let visible = content
+                .chars()
+                .skip(self.scroll_col)
                 // Don't display if O_PUBLIC is not set (password field)
-                let display_ch = if is_public {
-                    ch
-                } else if ch != self.pad {
-                    '*' // Mask non-pad characters
-                } else {
-                    self.pad
-                };
+                .map(|ch| if is_public || ch == self.pad { ch } else { '*' })
+                .take_while(|ch| {
+                    used += Self::char_cols(*ch);
+                    used <= width
+                })
+                .collect::<Vec<_>>();
+            let shown: usize = visible.iter().map(|ch| Self::char_cols(*ch)).sum();
+            let padding = std::iter::repeat_n(self.pad, width.saturating_sub(shown));
 
+            for display_ch in visible.into_iter().chain(padding) {
                 if is_visible {
                     // A character outside Latin-1 does not fit in a ChType
                     #[cfg(feature = "wide")]
@@ -2982,6 +3040,151 @@ mod tests {
         win.mv(1, 4).unwrap();
         let latin = win.in_wch();
         assert_eq!((latin.spacing_char(), latin.attrs()), ('é', A_BOLD));
+    }
+
+    #[test]
+    fn test_field_holds_as_many_double_width_characters_as_fit() {
+        // Four columns hold two double-width characters and nothing more.
+        let mut field = Field::new(1, 4, 0, 0, 0, 0);
+        for ch in "日本語a".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日本");
+
+        // Five hold two of them and one ordinary character.
+        let mut field = Field::new(1, 5, 0, 0, 0, 0);
+        for ch in "日本語a語b".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日本a");
+
+        // The same goes for a multi-line field's total.
+        let mut field = Field::new(2, 4, 0, 0, 0, 0);
+        for ch in "日本語学校a".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日本\n語学");
+    }
+
+    #[test]
+    fn test_field_wraps_double_width_characters_by_their_width() {
+        let mut field = Field::new(3, 4, 0, 0, 0, 0);
+        for ch in "日本語".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日本\n語");
+        assert_eq!(field.cursor_pos(), (1, 1));
+
+        // A character that needs both columns of what is left moves down
+        // whole.
+        let mut field = Field::new(3, 3, 0, 0, 0, 0);
+        for ch in "a日本".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "a日\n本");
+
+        // A field narrower than the character gives it a line to itself.
+        let mut field = Field::new(3, 1, 0, 0, 0, 0);
+        field.set_opts(field.opts() & !FieldOpts::O_STATIC);
+        for ch in "日本".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日\n本");
+    }
+
+    #[test]
+    fn test_field_cursor_is_placed_by_the_width_of_the_text_before_it() {
+        let mut field = Field::new(1, 10, 1, 2, 0, 0);
+        field.set_buffer("日本x");
+        assert_eq!(field.cursor_in_window(), (0, 0));
+        field.cursor_right();
+        assert_eq!(field.cursor_in_window(), (0, 2));
+        field.cursor_right();
+        assert_eq!(field.cursor_in_window(), (0, 4));
+        field.cursor_right();
+        assert_eq!(field.cursor_in_window(), (0, 5));
+
+        let mut win = Window::new(3, 20, 0, 0).unwrap();
+        field.render(&mut win, true).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 7));
+    }
+
+    #[test]
+    fn test_field_scrolls_sideways_by_the_width_of_the_text() {
+        let mut field = Field::new(1, 4, 0, 0, 0, 0);
+        field.set_buffer("日本語学");
+
+        // The cursor at the end of the line has to be inside the field.
+        field.cursor_line_end();
+        assert_eq!(field.cursor_col(), 4);
+        assert_eq!(field.scroll_col(), 3);
+        assert_eq!(field.cursor_in_window(), (0, 2));
+        field.cursor_line_home();
+        assert_eq!(field.scroll_col(), 0);
+
+        // Scrolling stops when the end of the line is in view.
+        field.scroll_hforward(10);
+        assert_eq!(field.scroll_col(), 2);
+        field.scroll_hbackward(10);
+        assert_eq!(field.scroll_col(), 0);
+
+        // A mix: "a" and three double-width characters in five columns.
+        let mut field = Field::new(1, 5, 0, 0, 0, 0);
+        field.set_buffer("a日本語");
+        field.scroll_hforward(10);
+        assert_eq!(field.scroll_col(), 2);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_field_renders_double_width_characters_inside_its_columns() {
+        /// The spacing character of the first `n` cells of a line.
+        fn cells(win: &mut Window, y: i32, n: i32) -> Vec<char> {
+            (0..n)
+                .map(|x| {
+                    win.mv(y, x).unwrap();
+                    win.in_wch().spacing_char()
+                })
+                .collect()
+        }
+
+        // Exactly filled: nothing is written past the field.
+        let mut field = Field::new(1, 4, 0, 1, 0, 0);
+        field.set_buffer("日本語x");
+        let mut win = Window::new(2, 8, 0, 0).unwrap();
+        win.mvaddstr(0, 0, "<<<<<<<<").unwrap();
+        field.render(&mut win, false).unwrap();
+        assert_eq!(
+            cells(&mut win, 0, 8),
+            ['<', '日', '\0', '本', '\0', '<', '<', '<']
+        );
+
+        // One column left over: the next double-width character does not
+        // fit, and the column is padded.
+        let mut field = Field::new(1, 5, 0, 1, 0, 0);
+        field.set_pad('_');
+        field.set_buffer("日本語");
+        let mut win = Window::new(2, 8, 0, 0).unwrap();
+        win.mvaddstr(0, 0, "<<<<<<<<").unwrap();
+        field.render(&mut win, false).unwrap();
+        assert_eq!(
+            cells(&mut win, 0, 8),
+            ['<', '日', '\0', '本', '\0', '_', '<', '<']
+        );
+
+        // Scrolled sideways, and a password field shows one star each.
+        field.scroll_hforward(1);
+        field.render(&mut win, false).unwrap();
+        assert_eq!(
+            cells(&mut win, 0, 8),
+            ['<', '本', '\0', '語', '\0', '_', '<', '<']
+        );
+        field.set_opts(field.opts() & !FieldOpts::O_PUBLIC);
+        field.render(&mut win, false).unwrap();
+        assert_eq!(
+            cells(&mut win, 0, 8),
+            ['<', '*', '*', '_', '_', '_', '<', '<']
+        );
     }
 
     #[test]
