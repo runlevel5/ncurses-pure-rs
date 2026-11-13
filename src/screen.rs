@@ -267,17 +267,21 @@ impl Screen {
     }
 
     /// Resize the terminal to the specified size.
+    ///
+    /// The standard screen keeps its contents, as far as they fit, and its
+    /// settings. The next refresh clears the terminal and repaints it.
     pub fn resize_term(&mut self, lines: i32, cols: i32) -> Result<()> {
+        // Resize the windows in place
+        self.stdscr.resize(lines, cols)?;
+        self.curscr.resize(lines, cols)?;
+        self.newscr.resize(lines, cols)?;
+
         // Update global dimensions
         globals::set_dimensions(lines, cols);
 
-        // Recreate windows with new size
-        self.stdscr = Window::new(lines, cols, 0, 0)?;
-        self.curscr = Window::new(lines, cols, 0, 0)?;
-        self.newscr = Window::new(lines, cols, 0, 0)?;
-
-        // Mark everything as needing update
-        self.stdscr.touchwin();
+        // What the terminal shows after a resize is anyone's guess: start
+        // again from a clear screen.
+        self.stdscr.clearok(true);
 
         Ok(())
     }
@@ -5769,6 +5773,51 @@ mod output_tests {
         assert_eq!(t.shown.rows(), ["one", "", "    tw"]);
         // The cursor is where the last window copied has its cursor.
         assert_eq!((t.shown.y, t.shown.x), (2, 6));
+    }
+
+    #[test]
+    fn test_resize_term_keeps_the_standard_screen() {
+        let mut t = TestScreen::new(3, 10);
+        t.screen.stdscr_mut().keypad(true);
+        t.screen.stdscr_mut().scrollok(true);
+        t.screen.attron(attr::A_BOLD).unwrap();
+        t.screen.mvaddstr(0, 0, "kept").unwrap();
+        t.screen.mvaddstr(2, 5, "edge").unwrap();
+        t.refresh();
+
+        t.screen.resize_term(5, 20).unwrap();
+        let stdscr = t.screen.stdscr();
+        assert_eq!((stdscr.getmaxy(), stdscr.getmaxx()), (5, 20));
+        assert!(stdscr.is_keypad());
+        assert!(stdscr.is_scrollok());
+        assert_eq!(stdscr.getattrs(), attr::A_BOLD);
+        assert_eq!((stdscr.getcury(), stdscr.getcurx()), (2, 9));
+
+        // The terminal is repainted from scratch at its new size.
+        t.shown = FakeTerminal::new(5, 20);
+        t.shown.fill('#');
+        assert_eq!(t.refresh(), ["kept", "", "     edge", "", ""]);
+
+        // The new lines are part of the screen.
+        t.screen.mvaddstr(4, 15, "new").unwrap();
+        assert_eq!(t.refresh()[4], "               new");
+    }
+
+    #[test]
+    fn test_resize_term_to_a_smaller_size_cuts_the_contents_off() {
+        let mut t = TestScreen::new(4, 10);
+        t.screen.mvaddstr(0, 0, "abcdefgh").unwrap();
+        t.screen.mvaddstr(3, 0, "gone").unwrap();
+        t.refresh();
+
+        t.screen.resize_term(2, 5).unwrap();
+        let stdscr = t.screen.stdscr();
+        assert_eq!((stdscr.getmaxy(), stdscr.getmaxx()), (2, 5));
+        assert_eq!((stdscr.getcury(), stdscr.getcurx()), (1, 4));
+
+        t.shown = FakeTerminal::new(2, 5);
+        t.shown.fill('#');
+        assert_eq!(t.refresh(), ["abcde", ""]);
     }
 
     #[test]
