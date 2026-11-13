@@ -245,7 +245,7 @@ impl Menu {
             .enumerate()
             .map(|(i, mut item)| {
                 item.index = i;
-                name_width = name_width.max(item.name.len());
+                name_width = name_width.max(item.name.chars().count());
                 desc_width = desc_width.max(item.description.len());
                 Rc::new(RefCell::new(item))
             })
@@ -317,7 +317,7 @@ impl Menu {
             .enumerate()
             .map(|(i, mut item)| {
                 item.index = i;
-                name_width = name_width.max(item.name.len());
+                name_width = name_width.max(item.name.chars().count());
                 desc_width = desc_width.max(item.description.len());
                 Rc::new(RefCell::new(item))
             })
@@ -519,7 +519,7 @@ impl Menu {
 
     /// Find the next item matching the pattern, starting from `start`.
     fn find_match_forward(&self, start: usize) -> Option<usize> {
-        if self.pattern.is_empty() {
+        if self.pattern.is_empty() || self.items.is_empty() {
             return None;
         }
         let ignore_case = self.opts.contains(MenuOpts::O_IGNORECASE);
@@ -546,9 +546,10 @@ impl Menu {
 
     /// Find the previous item matching the pattern, starting from `start`.
     fn find_match_backward(&self, start: usize) -> Option<usize> {
-        if self.pattern.is_empty() {
+        if self.pattern.is_empty() || self.items.is_empty() {
             return None;
         }
+        let start = start.min(self.items.len() - 1);
         let ignore_case = self.opts.contains(MenuOpts::O_IGNORECASE);
 
         // Helper to check if item name starts with pattern
@@ -746,9 +747,7 @@ impl Menu {
         };
 
         // Pre-allocate reusable buffer for padding to avoid repeated allocations
-        let mark_len = self.mark.len();
-        let empty_mark: String = " ".repeat(mark_len);
-        let spacing_str: String = " ".repeat(self.spacing);
+        let empty_mark: String = " ".repeat(self.mark.chars().count());
 
         for row in 0..self.rows as usize {
             if row >= maxy {
@@ -783,41 +782,54 @@ impl Menu {
             } else {
                 &empty_mark
             };
-            win.addstr(mark_display)?;
+            // Everything drawn for an item stays inside its column, however
+            // long its texts are: `room` is what is left of the column.
+            let mut room = col_width;
+            let name_len = item.name.chars().count();
 
-            // Draw item name with padding (avoid allocation when possible)
-            let name = &item.name;
-            if name.len() >= self.name_width {
-                win.addnstr(name, self.name_width as i32)?;
-            } else {
-                win.addstr(name)?;
-                // Add padding using spaces
-                for _ in 0..(self.name_width - name.len()) {
-                    win.addch(b' ' as ChType)?;
-                }
-            }
+            Self::put(&mut win, &mut room, mark_display, usize::MAX)?;
+
+            // Draw item name, padded to the width of the longest name
+            Self::put(&mut win, &mut room, &item.name, self.name_width)?;
+            Self::pad(
+                &mut win,
+                &mut room,
+                self.name_width.saturating_sub(name_len),
+            )?;
 
             // Draw description if enabled
             if show_desc && self.desc_width > 0 {
-                win.addstr(&spacing_str)?;
-                let desc = &item.description;
-                let available = col_width.saturating_sub(mark_len + self.name_width + self.spacing);
-                if desc.len() > available {
-                    win.addnstr(desc, available as i32)?;
-                } else {
-                    win.addstr(desc)?;
-                }
+                Self::pad(&mut win, &mut room, self.spacing)?;
+                Self::put(&mut win, &mut room, &item.description, usize::MAX)?;
             }
 
-            // Clear to end of line using character output instead of string allocation
-            let cur_x = win.getcurx() as usize;
-            for _ in cur_x..col_width {
-                win.addch(b' ' as ChType)?;
-            }
+            // Clear the rest of the column
+            Self::pad(&mut win, &mut room, usize::MAX)?;
 
             win.attrset(0)?;
         }
 
+        Ok(())
+    }
+
+    /// Write at most `at_most` characters of `text`, and no more than the
+    /// `room` left in the item's column, which shrinks by what was written.
+    fn put(win: &mut Window, room: &mut usize, text: &str, at_most: usize) -> Result<()> {
+        let count = text.chars().count().min(at_most).min(*room);
+        *room -= count;
+        if count > 0 {
+            win.addnstr(text, count as i32)?;
+        }
+        Ok(())
+    }
+
+    /// Write `count` spaces, or as many as there is `room` for.
+    fn pad(win: &mut Window, room: &mut usize, count: usize) -> Result<()> {
+        let count = count.min(*room);
+        *room -= count;
+        for _ in 0..count {
+            win.addch(b' ' as ChType)?;
+        }
         Ok(())
     }
 
@@ -1449,6 +1461,93 @@ mod tests {
         let mut menu = Menu::new(vec![]);
         menu.set_format(10, 2);
         assert_eq!(menu.format(), (10, 2));
+    }
+
+    /// What a menu draws into a window of `lines` by `cols`.
+    fn rendered(menu: &mut Menu, lines: i32, cols: i32) -> Vec<String> {
+        menu.set_window(Window::new(lines, cols, 0, 0).unwrap());
+        menu.render().unwrap();
+        let mut win = menu.window.as_ref().unwrap().borrow_mut();
+        (0..lines)
+            .map(|y| {
+                win.mv(y, 0).unwrap();
+                win.instr(cols)
+            })
+            .collect()
+    }
+
+    fn menu_of(names: &[&str]) -> Menu {
+        let mut menu = Menu::new(names.iter().map(|name| MenuItem::new(name, "")).collect());
+        menu.set_mark("");
+        menu
+    }
+
+    #[test]
+    fn test_menu_item_that_fills_the_last_row_is_drawn_whole() {
+        let mut menu = menu_of(&["abcd", "wxyz"]);
+        assert_eq!(rendered(&mut menu, 2, 4), ["abcd", "wxyz"]);
+
+        // With a mark in front, in a window that is exactly wide enough.
+        menu.set_mark(">");
+        assert_eq!(rendered(&mut menu, 2, 5), [" abcd", " wxyz"]);
+    }
+
+    #[test]
+    fn test_menu_item_does_not_run_on_into_the_next_row() {
+        // Names longer than the window is wide are cut off.
+        let mut menu = menu_of(&["abcdef", "xy"]);
+        assert_eq!(rendered(&mut menu, 2, 3), ["abc", "xy "]);
+
+        // So are descriptions.
+        let mut menu = Menu::new(vec![
+            MenuItem::new("ab", "a description far too long"),
+            MenuItem::new("cd", "x"),
+        ]);
+        menu.set_mark("");
+        let rows = rendered(&mut menu, 3, 6);
+        assert!(rows[0].starts_with("ab"), "{rows:?}");
+        assert!(rows[1].starts_with("cd"), "{rows:?}");
+        assert_eq!(rows[2], "      ");
+    }
+
+    #[test]
+    fn test_menu_pads_names_by_their_characters() {
+        let mut menu = menu_of(&["né", "abc"]);
+        assert_eq!(rendered(&mut menu, 2, 5), ["né   ", "abc  "]);
+    }
+
+    #[test]
+    fn test_empty_menu_ignores_pattern_matching() {
+        let mut menu = Menu::new(vec![]);
+        menu.driver('a' as i32).unwrap();
+        menu.driver(REQ_NEXT_MATCH).unwrap();
+        menu.driver(REQ_PREV_MATCH).unwrap();
+        assert_eq!(menu.current_item_index(), 0);
+        assert_eq!(rendered(&mut menu, 1, 3), ["   "]);
+    }
+
+    #[test]
+    fn test_menu_pattern_matching_wraps_round_in_both_directions() {
+        let mut menu = menu_of(&["Apple", "Banana", "Apricot", "Cherry"]);
+        menu.driver('A' as i32).unwrap();
+        for (request, expected) in [
+            (REQ_NEXT_MATCH, 2),
+            (REQ_NEXT_MATCH, 0),
+            (REQ_PREV_MATCH, 2),
+            (REQ_PREV_MATCH, 0),
+        ] {
+            menu.driver(request).unwrap();
+            assert_eq!(menu.current_item_index(), expected);
+        }
+
+        // A pattern on the last item wraps too.
+        let mut menu = menu_of(&["Apple", "Cherry"]);
+        menu.driver('C' as i32).unwrap();
+        assert_eq!(menu.current_item_index(), 1);
+        menu.driver(REQ_NEXT_MATCH).unwrap();
+        assert_eq!(menu.current_item_index(), 1);
+        menu.driver(REQ_PREV_MATCH).unwrap();
+        assert_eq!(menu.current_item_index(), 1);
     }
 
     #[test]
