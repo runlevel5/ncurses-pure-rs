@@ -182,7 +182,7 @@ impl SlkState {
         let num = format.num_labels();
         Self {
             format,
-            labels: (0..num).map(|_| SoftLabel::new()).collect(),
+            labels: Vec::from_fn(num, |_| SoftLabel::new()),
             initialized: false,
             hidden: false,
             attrs: 0,
