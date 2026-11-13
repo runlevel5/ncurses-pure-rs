@@ -1073,7 +1073,12 @@ impl Terminal {
     }
 
     /// Set foreground color.
-    pub fn set_fg_color(&mut self, color: i16) -> Result<()> {
+    ///
+    /// A negative number is the terminal's default color. Colors up to 255
+    /// are palette colors. A larger number is a direct color, `0xRRGGBB`,
+    /// as on a terminal with millions of colors.
+    pub fn set_fg_color(&mut self, color: impl Into<i32>) -> Result<()> {
+        let color = color.into();
         if color < 0 {
             // Default color
             self.write_escape("\x1b[39m")
@@ -1083,14 +1088,22 @@ impl Terminal {
         } else if color < 16 {
             let seq = format!("\x1b[{}m", 90 + color - 8);
             self.write_str(&seq)
-        } else {
+        } else if color < 256 {
             let seq = format!("\x1b[38;5;{}m", color);
+            self.write_str(&seq)
+        } else {
+            let [_, red, green, blue] = color.to_be_bytes();
+            let seq = format!("\x1b[38;2;{red};{green};{blue}m");
             self.write_str(&seq)
         }
     }
 
     /// Set background color.
-    pub fn set_bg_color(&mut self, color: i16) -> Result<()> {
+    ///
+    /// The color numbers mean what they do for
+    /// [`set_fg_color`](Self::set_fg_color).
+    pub fn set_bg_color(&mut self, color: impl Into<i32>) -> Result<()> {
+        let color = color.into();
         if color < 0 {
             // Default color
             self.write_escape("\x1b[49m")
@@ -1100,8 +1113,12 @@ impl Terminal {
         } else if color < 16 {
             let seq = format!("\x1b[{}m", 100 + color - 8);
             self.write_str(&seq)
-        } else {
+        } else if color < 256 {
             let seq = format!("\x1b[48;5;{}m", color);
+            self.write_str(&seq)
+        } else {
+            let [_, red, green, blue] = color.to_be_bytes();
+            let seq = format!("\x1b[48;2;{red};{green};{blue}m");
             self.write_str(&seq)
         }
     }
@@ -1509,6 +1526,40 @@ mod output_tests {
     /// Bytes that show up any loss or reordering.
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn colors_are_sent_in_the_form_their_number_calls_for() {
+        let (mut terminal, mut output, write) = terminal_on_a_pipe();
+        for color in [-1, 0, 7, 8, 15, 16, 255, 256, 0x12_34_56, 0xFF_FF_FF] {
+            terminal.set_fg_color(color).unwrap();
+            terminal.set_bg_color(color).unwrap();
+            terminal.write(b"|").unwrap();
+        }
+        // A `ColorT` is accepted as it is.
+        terminal.set_fg_color(3_i16).unwrap();
+        terminal.flush().unwrap();
+        drop((terminal, write));
+
+        let mut written = String::new();
+        output.read_to_string(&mut written).unwrap();
+        let sent: Vec<&str> = written.split('|').collect();
+        assert_eq!(
+            sent,
+            [
+                "\x1b[39m\x1b[49m",
+                "\x1b[30m\x1b[40m",
+                "\x1b[37m\x1b[47m",
+                "\x1b[90m\x1b[100m",
+                "\x1b[97m\x1b[107m",
+                "\x1b[38;5;16m\x1b[48;5;16m",
+                "\x1b[38;5;255m\x1b[48;5;255m",
+                "\x1b[38;2;0;1;0m\x1b[48;2;0;1;0m",
+                "\x1b[38;2;18;52;86m\x1b[48;2;18;52;86m",
+                "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m",
+                "\x1b[33m",
+            ]
+        );
     }
 
     #[test]

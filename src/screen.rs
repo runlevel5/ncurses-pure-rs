@@ -1096,7 +1096,7 @@ impl Screen {
         // Handle color pair
         let pair = attr::pair_number(attr);
         if pair > 0 {
-            if let Ok((fg, bg)) = self.colors.pair_content(pair) {
+            if let Some((fg, bg)) = self.colors.pair_colors(i32::from(pair)) {
                 self.terminal.set_fg_color(fg)?;
                 self.terminal.set_bg_color(bg)?;
             }
