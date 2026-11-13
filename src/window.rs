@@ -3,7 +3,9 @@
 //! This module implements the WINDOW structure and all window-related
 //! operations as defined by the X/Open XSI Curses standard.
 
-use crate::attr::{self, A_CHARTEXT, A_NORMAL, color_pair};
+#[cfg(not(feature = "wide"))]
+use crate::attr::A_CHARTEXT;
+use crate::attr::{self, A_NORMAL, color_pair};
 use crate::error::{Error, Result};
 use crate::line::LineData;
 use crate::types::{AttrT, ChType, NcursesSize, WindowFlags};
@@ -427,6 +429,9 @@ impl Window {
             line.resize(new_width, fill);
         }
 
+        // A scroll region covering the whole window keeps covering it.
+        let region_was_whole_window = self.regtop == 0 && self.regbottom == self.maxy;
+
         // Update dimensions
         self.maxy = (new_height - 1) as NcursesSize;
         self.maxx = (new_width - 1) as NcursesSize;
@@ -439,9 +444,12 @@ impl Window {
             self.curx = self.maxx;
         }
 
-        // Update scroll region
-        if self.regbottom >= new_height as NcursesSize {
+        // Update scroll region: it must stay inside the window.
+        if region_was_whole_window {
             self.regbottom = self.maxy;
+        } else {
+            self.regtop = self.regtop.min(self.maxy);
+            self.regbottom = self.regbottom.min(self.maxy);
         }
 
         // Touch entire window to ensure refresh
@@ -764,11 +772,7 @@ impl Window {
     /// Add a character at the current cursor position (wide character version).
     #[cfg(feature = "wide")]
     pub fn addch(&mut self, ch: ChType) -> Result<()> {
-        // Convert ChType to CCharT
-        let c = (ch & A_CHARTEXT) as u8 as char;
-        let attr = (ch & !A_CHARTEXT) | self.attrs;
-        let cchar = CCharT::from_char_attr(c, attr);
-        self.add_wch_internal(cchar)
+        self.add_wch_internal(CCharT::from_chtype(ch | self.attrs))
     }
 
     /// Add a wide character at the current position.
@@ -998,11 +1002,7 @@ impl Window {
             #[cfg(not(feature = "wide"))]
             self.lines[y].set(x, ch | self.attrs);
             #[cfg(feature = "wide")]
-            {
-                let c = (ch & A_CHARTEXT) as u8 as char;
-                let attr = (ch & !A_CHARTEXT) | self.attrs;
-                self.lines[y].set(x, CCharT::from_char_attr(c, attr));
-            }
+            self.lines[y].set(x, CCharT::from_chtype(ch | self.attrs));
         }
 
         Ok(())
@@ -1138,9 +1138,7 @@ impl Window {
         let y = self.cury as usize;
         let x = self.curx as usize;
         if y <= self.maxy as usize && x <= self.maxx as usize {
-            let cchar = self.lines[y].get(x);
-            let c = cchar.spacing_char() as u8 as ChType;
-            c | cchar.attrs()
+            self.lines[y].get(x).to_chtype()
         } else {
             0
         }
@@ -1218,9 +1216,7 @@ impl Window {
             }
             #[cfg(feature = "wide")]
             {
-                let cchar = self.lines[y].get(x);
-                let c = cchar.spacing_char() as u8 as ChType;
-                *ch = c | cchar.attrs();
+                *ch = self.lines[y].get(x).to_chtype();
             }
             count += 1;
         }
@@ -1312,13 +1308,16 @@ impl Window {
 
     /// Scroll the window up by n lines.
     pub fn scroll_up(&mut self, n: i32) -> Result<()> {
-        if n <= 0 {
-            return Ok(());
+        if n > 0 {
+            self.shift_lines_up(n, self.regtop as usize, self.regbottom as usize);
         }
+        Ok(())
+    }
 
-        let n = n.min((self.regbottom - self.regtop + 1) as i32) as usize;
-        let top = self.regtop as usize;
-        let bottom = self.regbottom as usize;
+    /// Move the lines `top..=bottom` up by `n` (which must be positive),
+    /// dropping the first `n` of them and clearing the last `n`.
+    fn shift_lines_up(&mut self, n: i32, top: usize, bottom: usize) {
+        let n = (n as usize).min(bottom + 1 - top);
 
         #[cfg(not(feature = "wide"))]
         let fill = self.bkgd;
@@ -1339,19 +1338,20 @@ impl Window {
         for line in &mut self.lines[first_cleared..=bottom] {
             line.fill(fill);
         }
-
-        Ok(())
     }
 
     /// Scroll the window down by n lines.
     pub fn scroll_down(&mut self, n: i32) -> Result<()> {
-        if n <= 0 {
-            return Ok(());
+        if n > 0 {
+            self.shift_lines_down(n, self.regtop as usize, self.regbottom as usize);
         }
+        Ok(())
+    }
 
-        let n = n.min((self.regbottom - self.regtop + 1) as i32) as usize;
-        let top = self.regtop as usize;
-        let bottom = self.regbottom as usize;
+    /// Move the lines `top..=bottom` down by `n` (which must be positive),
+    /// dropping the last `n` of them and clearing the first `n`.
+    fn shift_lines_down(&mut self, n: i32, top: usize, bottom: usize) {
+        let n = (n as usize).min(bottom + 1 - top);
 
         #[cfg(not(feature = "wide"))]
         let fill = self.bkgd;
@@ -1368,8 +1368,6 @@ impl Window {
         for line in &mut self.lines[top..(top + n)] {
             line.fill(fill);
         }
-
-        Ok(())
     }
 
     /// Scroll the scrolling region (wscrl).
@@ -1447,9 +1445,7 @@ impl Window {
     /// Set the background character and attribute (wide character version).
     #[cfg(feature = "wide")]
     pub fn bkgdset(&mut self, ch: ChType) {
-        let c = (ch & A_CHARTEXT) as u8 as char;
-        let attr = ch & !A_CHARTEXT;
-        self.bkgrnd = CCharT::from_char_attr(c, attr);
+        self.bkgrnd = CCharT::from_chtype(ch);
     }
 
     /// Get the background character.
@@ -1463,8 +1459,7 @@ impl Window {
     #[cfg(feature = "wide")]
     #[must_use]
     pub fn getbkgd(&self) -> ChType {
-        let c = self.bkgrnd.spacing_char() as u8 as ChType;
-        c | self.bkgrnd.attrs()
+        self.bkgrnd.to_chtype()
     }
 
     /// Set the background and apply to entire window.
@@ -1504,9 +1499,7 @@ impl Window {
     /// Set the background and apply to entire window (wide character version).
     #[cfg(feature = "wide")]
     pub fn bkgd(&mut self, ch: ChType) -> Result<()> {
-        let c = (ch & A_CHARTEXT) as u8 as char;
-        let attr = ch & !A_CHARTEXT;
-        self.bkgrnd = CCharT::from_char_attr(c, attr);
+        self.bkgrnd = CCharT::from_chtype(ch);
         // For simplicity, just set background without full update
         Ok(())
     }
@@ -1636,77 +1629,94 @@ impl Window {
         bl: ChType,
         br: ChType,
     ) -> Result<()> {
-        // Default characters if 0
-        let ls = if ls == 0 { self.acs_vline() } else { ls };
-        let rs = if rs == 0 { self.acs_vline() } else { rs };
-        let ts = if ts == 0 { self.acs_hline() } else { ts };
-        let bs = if bs == 0 { self.acs_hline() } else { bs };
-        let tl = if tl == 0 { self.acs_ulcorner() } else { tl };
-        let tr = if tr == 0 { self.acs_urcorner() } else { tr };
-        let bl = if bl == 0 { self.acs_llcorner() } else { bl };
-        let br = if br == 0 { self.acs_lrcorner() } else { br };
+        // The default line-drawing characters do not fit in a `ChType`, so
+        // the border is drawn from complex characters.
+        #[cfg(feature = "wide")]
+        {
+            use crate::wide::wacs;
 
-        let maxy = self.maxy as usize;
-        let maxx = self.maxx as usize;
+            let ls = Self::chtype_or(ls, &wacs::VLINE);
+            let rs = Self::chtype_or(rs, &wacs::VLINE);
+            let ts = Self::chtype_or(ts, &wacs::HLINE);
+            let bs = Self::chtype_or(bs, &wacs::HLINE);
+            let tl = Self::chtype_or(tl, &wacs::ULCORNER);
+            let tr = Self::chtype_or(tr, &wacs::URCORNER);
+            let bl = Self::chtype_or(bl, &wacs::LLCORNER);
+            let br = Self::chtype_or(br, &wacs::LRCORNER);
 
-        // Corners
+            self.wborder_set(
+                Some(&ls),
+                Some(&rs),
+                Some(&ts),
+                Some(&bs),
+                Some(&tl),
+                Some(&tr),
+                Some(&bl),
+                Some(&br),
+            )
+        }
         #[cfg(not(feature = "wide"))]
         {
+            // Default characters if 0
+            let ls = if ls == 0 { self.acs_vline() } else { ls };
+            let rs = if rs == 0 { self.acs_vline() } else { rs };
+            let ts = if ts == 0 { self.acs_hline() } else { ts };
+            let bs = if bs == 0 { self.acs_hline() } else { bs };
+            let tl = if tl == 0 { self.acs_ulcorner() } else { tl };
+            let tr = if tr == 0 { self.acs_urcorner() } else { tr };
+            let bl = if bl == 0 { self.acs_llcorner() } else { bl };
+            let br = if br == 0 { self.acs_lrcorner() } else { br };
+
+            let maxy = self.maxy as usize;
+            let maxx = self.maxx as usize;
+
+            // Corners
             self.lines[0].set(0, tl);
             self.lines[0].set(maxx, tr);
             self.lines[maxy].set(0, bl);
             self.lines[maxy].set(maxx, br);
-        }
-        #[cfg(feature = "wide")]
-        {
-            self.set_ch_at(0, 0, tl);
-            self.set_ch_at(0, maxx as i32, tr);
-            self.set_ch_at(maxy as i32, 0, bl);
-            self.set_ch_at(maxy as i32, maxx as i32, br);
-        }
 
-        // Top and bottom edges
-        for x in 1..maxx {
-            #[cfg(not(feature = "wide"))]
-            {
+            // Top and bottom edges
+            for x in 1..maxx {
                 self.lines[0].set(x, ts);
                 self.lines[maxy].set(x, bs);
             }
-            #[cfg(feature = "wide")]
-            {
-                self.set_ch_at(0, x as i32, ts);
-                self.set_ch_at(maxy as i32, x as i32, bs);
-            }
-        }
 
-        // Left and right edges
-        for y in 1..maxy {
-            #[cfg(not(feature = "wide"))]
-            {
-                self.lines[y].set(0, ls);
-                self.lines[y].set(maxx, rs);
+            // Left and right edges
+            for line in self.lines.iter_mut().take(maxy).skip(1) {
+                line.set(0, ls);
+                line.set(maxx, rs);
             }
-            #[cfg(feature = "wide")]
-            {
-                self.set_ch_at(y as i32, 0, ls);
-                self.set_ch_at(y as i32, maxx as i32, rs);
-            }
-        }
 
-        Ok(())
+            Ok(())
+        }
     }
 
+    /// The cell a `ChType` border or line argument stands for: `default`
+    /// when it is 0, otherwise the character and attributes it carries.
     #[cfg(feature = "wide")]
-    fn set_ch_at(&mut self, y: i32, x: i32, ch: ChType) {
-        let c = (ch & A_CHARTEXT) as u8 as char;
-        let attr = ch & !A_CHARTEXT;
-        self.lines[y as usize].set(x as usize, CCharT::from_char_attr(c, attr));
+    fn chtype_or(ch: ChType, default: &CCharT) -> CCharT {
+        if ch == 0 {
+            *default
+        } else {
+            CCharT::from_chtype(ch)
+        }
+    }
+
+    /// How many cells a line of `n` draws when `room` cells are left before
+    /// the window's edge: none for a zero or negative `n`.
+    fn line_len(n: i32, room: i32) -> usize {
+        n.min(room).max(0) as usize
     }
 
     /// Draw a horizontal line.
+    ///
+    /// The line starts at the cursor and is at most `n` cells long, cut off
+    /// at the window's edge. Nothing is drawn when `n` is zero or negative.
     pub fn hline(&mut self, ch: ChType, n: i32) -> Result<()> {
+        #[cfg(not(feature = "wide"))]
         let ch = if ch == 0 { self.acs_hline() } else { ch };
-        let n = n.min((self.maxx - self.curx + 1) as i32) as usize;
+        let n = Self::line_len(n, (self.maxx - self.curx + 1) as i32);
         let y = self.cury as usize;
         let x = self.curx as usize;
 
@@ -1719,10 +1729,9 @@ impl Window {
         }
         #[cfg(feature = "wide")]
         {
-            // Extract character and attributes, combining with window attributes
-            let c = (ch & A_CHARTEXT) as u8 as char;
-            let attr = (ch & !A_CHARTEXT) | self.attrs;
-            let cchar = CCharT::from_char_attr(c, attr);
+            // The character and its attributes, combined with the window's
+            let mut cchar = Self::chtype_or(ch, &crate::wide::wacs::HLINE);
+            cchar.attr |= self.attrs;
             for i in 0..n {
                 self.lines[y].set(x + i, cchar);
             }
@@ -1732,9 +1741,13 @@ impl Window {
     }
 
     /// Draw a vertical line.
+    ///
+    /// The line starts at the cursor and is at most `n` cells long, cut off
+    /// at the window's edge. Nothing is drawn when `n` is zero or negative.
     pub fn vline(&mut self, ch: ChType, n: i32) -> Result<()> {
+        #[cfg(not(feature = "wide"))]
         let ch = if ch == 0 { self.acs_vline() } else { ch };
-        let n = n.min((self.maxy - self.cury + 1) as i32) as usize;
+        let n = Self::line_len(n, (self.maxy - self.cury + 1) as i32);
         let y = self.cury as usize;
         let x = self.curx as usize;
 
@@ -1747,10 +1760,9 @@ impl Window {
         }
         #[cfg(feature = "wide")]
         {
-            // Extract character and attributes, combining with window attributes
-            let c = (ch & A_CHARTEXT) as u8 as char;
-            let attr = (ch & !A_CHARTEXT) | self.attrs;
-            let cchar = CCharT::from_char_attr(c, attr);
+            // The character and its attributes, combined with the window's
+            let mut cchar = Self::chtype_or(ch, &crate::wide::wacs::VLINE);
+            cchar.attr |= self.attrs;
             for i in 0..n {
                 self.lines[y + i].set(x, cchar);
             }
@@ -1767,7 +1779,7 @@ impl Window {
         } else {
             *wch
         };
-        let n = n.min((self.maxx - self.curx + 1) as i32) as usize;
+        let n = Self::line_len(n, (self.maxx - self.curx + 1) as i32);
         let y = self.cury as usize;
         let x = self.curx as usize;
 
@@ -1786,7 +1798,7 @@ impl Window {
         } else {
             *wch
         };
-        let n = n.min((self.maxy - self.cury + 1) as i32) as usize;
+        let n = Self::line_len(n, (self.maxy - self.cury + 1) as i32);
         let y = self.cury as usize;
         let x = self.curx as usize;
 
@@ -1797,66 +1809,30 @@ impl Window {
         Ok(())
     }
 
-    // ACS character helpers using Unicode box-drawing characters
+    // ACS character helpers: the VT100 line-drawing codes with A_ALTCHARSET
+    #[cfg(not(feature = "wide"))]
     fn acs_hline(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_HLINE as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_HLINE)
-        }
+        crate::acs::acs_char(crate::acs::ACS_HLINE)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_vline(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_VLINE as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_VLINE)
-        }
+        crate::acs::acs_char(crate::acs::ACS_VLINE)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_ulcorner(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_ULCORNER as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_ULCORNER)
-        }
+        crate::acs::acs_char(crate::acs::ACS_ULCORNER)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_urcorner(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_URCORNER as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_URCORNER)
-        }
+        crate::acs::acs_char(crate::acs::ACS_URCORNER)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_llcorner(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_LLCORNER as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_LLCORNER)
-        }
+        crate::acs::acs_char(crate::acs::ACS_LLCORNER)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_lrcorner(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_LRCORNER as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_LRCORNER)
-        }
+        crate::acs::acs_char(crate::acs::ACS_LRCORNER)
     }
 
     // ========================================================================
@@ -1871,11 +1847,7 @@ impl Window {
         #[cfg(not(feature = "wide"))]
         self.lines[y].insert(x, ch | self.attrs, 1);
         #[cfg(feature = "wide")]
-        {
-            let c = (ch & A_CHARTEXT) as u8 as char;
-            let attr = (ch & !A_CHARTEXT) | self.attrs;
-            self.lines[y].insert(x, CCharT::from_char_attr(c, attr), 1);
-        }
+        self.lines[y].insert(x, CCharT::from_chtype(ch | self.attrs), 1);
 
         Ok(())
     }
@@ -1961,17 +1933,21 @@ impl Window {
         self.insdelln(-1)
     }
 
-    /// Insert or delete lines.
+    /// Insert or delete lines at the cursor.
+    ///
+    /// A positive `n` inserts `n` blank lines above the current line: it and
+    /// the lines below move down, and the last `n` lines of the window are
+    /// lost. A negative `n` deletes that many lines starting with the current
+    /// one: the lines below move up, and blank lines fill the bottom. Lines
+    /// above the cursor are not touched, and the scroll region plays no part.
     pub fn insdelln(&mut self, n: i32) -> Result<()> {
+        let (top, bottom) = (self.cury as usize, self.maxy as usize);
         if n > 0 {
-            // Insert lines (scroll down)
-            self.scroll_down(n)
+            self.shift_lines_down(n, top, bottom);
         } else if n < 0 {
-            // Delete lines (scroll up)
-            self.scroll_up(-n)
-        } else {
-            Ok(())
+            self.shift_lines_up(n.saturating_neg(), top, bottom);
         }
+        Ok(())
     }
 
     // ========================================================================
@@ -2287,12 +2263,20 @@ impl Window {
         }
     }
 
-    /// Mark a range of lines as changed.
+    /// Mark `count` lines from `start` as changed or unchanged.
+    ///
+    /// Lines past the end of the window are ignored. Nothing happens when
+    /// `start` or `count` is negative, or `start` is past the last line.
     pub fn touchln(&mut self, start: i32, count: i32, changed: bool) {
-        let start = start.max(0) as usize;
-        let end = (start + count as usize).min(self.lines.len());
+        let (Ok(start), Ok(count)) = (usize::try_from(start), usize::try_from(count)) else {
+            return;
+        };
+        let end = start.saturating_add(count).min(self.lines.len());
+        let Some(lines) = self.lines.get_mut(start..end) else {
+            return;
+        };
 
-        for line in &mut self.lines[start..end] {
+        for line in lines {
             if changed {
                 line.touch();
             } else {
@@ -2627,6 +2611,7 @@ impl std::fmt::Debug for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attr::{A_BOLD, A_UNDERLINE};
 
     #[test]
     fn test_window_creation() {
@@ -2670,12 +2655,398 @@ mod tests {
 
     /// The text of every line of a three-column window.
     fn rows(win: &mut Window) -> Vec<String> {
+        rows_of(win, 3)
+    }
+
+    /// The first `width` columns of every line of a window.
+    fn rows_of(win: &mut Window, width: i32) -> Vec<String> {
         (0..win.getmaxy())
             .map(|y| {
                 win.mv(y, 0).unwrap();
-                win.instr(3)
+                win.instr(width)
             })
             .collect()
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_default_border_uses_line_drawing_characters() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.box_(0, 0).unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│ │", "└─┘"]);
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.border(0, 0, 0, 0, 0, 0, 0, 0).unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│ │", "└─┘"]);
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.draw_border(crate::types::BorderChars::default())
+            .unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│ │", "└─┘"]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_border_mixes_given_and_default_characters() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.box_('|' as ChType, '-' as ChType).unwrap();
+        assert_eq!(rows(&mut win), ["┌-┐", "| |", "└-┘"]);
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        let (l, r, t, b) = ('l' as ChType, 'r' as ChType, 't' as ChType, 'b' as ChType);
+        win.border(
+            l,
+            r,
+            t,
+            b,
+            '1' as ChType,
+            '2' as ChType,
+            '3' as ChType,
+            '4' as ChType,
+        )
+        .unwrap();
+        assert_eq!(rows(&mut win), ["1t2", "l r", "3b4"]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_border_keeps_the_attributes_of_a_given_character() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.box_('|' as ChType | A_BOLD, 0).unwrap();
+        let side = win.lines[1].get(0);
+        assert_eq!((side.spacing_char(), side.attr), ('|', A_BOLD));
+        // A default character carries no attributes of its own.
+        let top = win.lines[0].get(1);
+        assert_eq!((top.spacing_char(), top.attr), ('─', A_NORMAL));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_default_hline_and_vline_use_line_drawing_characters() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.hline(0, 3).unwrap();
+        win.mv(1, 1).unwrap();
+        win.vline(0, 2).unwrap();
+        assert_eq!(rows(&mut win), ["───", " │ ", " │ "]);
+
+        // The window's attributes apply to the default character too.
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.attron(A_BOLD).unwrap();
+        win.hline(0, 1).unwrap();
+        win.vline('!' as ChType | A_UNDERLINE, 1).unwrap();
+        let cell = win.lines[0].get(0);
+        assert_eq!(
+            (cell.spacing_char(), cell.attr),
+            ('!', A_BOLD | A_UNDERLINE)
+        );
+        win.hline(0, 1).unwrap();
+        let cell = win.lines[0].get(0);
+        assert_eq!((cell.spacing_char(), cell.attr), ('─', A_BOLD));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_characters_can_be_drawn_through_a_chtype() {
+        use crate::acs::*;
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.addch(acs_char(ACS_ULCORNER)).unwrap();
+        win.addch(acs_char(ACS_HLINE)).unwrap();
+        win.addch(acs_char(ACS_URCORNER)).unwrap();
+        win.mv(1, 0).unwrap();
+        win.insch(acs_char(ACS_VLINE)).unwrap();
+        win.mv(2, 0).unwrap();
+        win.addchstr(&[
+            acs_char(ACS_LLCORNER),
+            acs_char(ACS_DIAMOND),
+            acs_char(ACS_PI),
+        ])
+        .unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│  ", "└◆π"]);
+
+        // The cell holds the character itself, without A_ALTCHARSET.
+        let cell = win.lines[0].get(1);
+        assert_eq!((cell.spacing_char(), cell.attr), ('─', A_NORMAL));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_characters_keep_their_other_attributes() {
+        use crate::acs::*;
+
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addch(acs_char(ACS_HLINE) | A_BOLD).unwrap();
+        win.attron(A_UNDERLINE).unwrap();
+        win.addch(acs_char(ACS_VLINE)).unwrap();
+        let cells = [win.lines[0].get(0), win.lines[0].get(1)];
+        assert_eq!((cells[0].spacing_char(), cells[0].attr), ('─', A_BOLD));
+        assert_eq!((cells[1].spacing_char(), cells[1].attr), ('│', A_UNDERLINE));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_altcharset_attribute_turns_codes_into_line_drawing() {
+        use crate::attr::A_ALTCHARSET;
+
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.attron(A_ALTCHARSET).unwrap();
+        win.addch('l' as ChType).unwrap();
+        win.addch('q' as ChType).unwrap();
+        // A character that is not a line-drawing code stays as it is.
+        win.addch('A' as ChType).unwrap();
+        assert_eq!(rows(&mut win), ["┌─A"]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_characters_in_borders_and_lines() {
+        use crate::acs::*;
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.box_(acs_char(ACS_VLINE), acs_char(ACS_HLINE)).unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│ │", "└─┘"]);
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        let (tee, plus) = (acs_char(ACS_TTEE), acs_char(ACS_PLUS));
+        win.border(0, 0, 0, 0, tee, tee, plus, plus).unwrap();
+        assert_eq!(rows(&mut win), ["┬─┬", "│ │", "┼─┼"]);
+
+        let mut win = Window::new(2, 3, 0, 0).unwrap();
+        win.hline(acs_char(ACS_S9), 3).unwrap();
+        win.mv(0, 1).unwrap();
+        win.vline(acs_char(ACS_CKBOARD), 2).unwrap();
+        assert_eq!(rows(&mut win), ["⎽▒⎽", " ▒ "]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_characters_read_back_as_the_chtype_that_drew_them() {
+        use crate::acs::*;
+
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        let drawn = [
+            acs_char(ACS_HLINE) | A_BOLD,
+            acs_char(ACS_LARROW),
+            'x' as ChType | A_UNDERLINE,
+            0xE9, // é fits in a ChType as it is
+        ];
+        win.addchstr(&drawn).unwrap();
+
+        let mut read = [0; 4];
+        assert_eq!(win.inchnstr(&mut read, 4), 4);
+        assert_eq!(read, drawn);
+        win.mv(0, 1).unwrap();
+        assert_eq!(win.inch(), acs_char(ACS_LARROW));
+
+        // Drawing what was read gives the same characters again.
+        let mut copy = Window::new(1, 4, 0, 0).unwrap();
+        copy.addchstr(&read).unwrap();
+        assert_eq!(rows_of(&mut copy, 4), rows_of(&mut win, 4));
+        assert_eq!(rows_of(&mut copy, 4), ["─←xé"]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_background_character() {
+        use crate::acs::*;
+
+        let mut win = Window::new(1, 2, 0, 0).unwrap();
+        win.bkgdset(acs_char(ACS_BOARD));
+        assert_eq!(win.getbkgd(), acs_char(ACS_BOARD));
+        win.erase().unwrap();
+        assert_eq!(rows_of(&mut win, 2), ["▓▓"]);
+    }
+
+    #[test]
+    fn test_border_of_a_one_cell_window_does_not_panic() {
+        for (lines, cols) in [(1, 1), (1, 4), (4, 1), (2, 2)] {
+            let mut win = Window::new(lines, cols, 0, 0).unwrap();
+            win.box_(0, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_hline_and_vline_draw_nothing_for_a_negative_count() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.mv(1, 1).unwrap();
+        for n in [0, -1, i32::MIN] {
+            win.hline('-' as ChType, n).unwrap();
+            win.vline('|' as ChType, n).unwrap();
+        }
+        assert_eq!(rows(&mut win), ["   ", "   ", "   "]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_hline_set_and_vline_set_draw_nothing_for_a_negative_count() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.mv(1, 1).unwrap();
+        let ch = CCharT::from_char('x');
+        for n in [0, -1, i32::MIN] {
+            win.hline_set(&ch, n).unwrap();
+            win.vline_set(&ch, n).unwrap();
+        }
+        assert_eq!(rows(&mut win), ["   ", "   ", "   "]);
+    }
+
+    #[test]
+    fn test_hline_and_vline_stop_at_the_window_edge() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.mv(1, 1).unwrap();
+        win.hline('-' as ChType, 10).unwrap();
+        win.vline('|' as ChType, 10).unwrap();
+        assert_eq!(rows(&mut win), ["   ", " |-", " | "]);
+    }
+
+    /// Which lines of the window are marked as changed.
+    fn touched(win: &Window) -> Vec<bool> {
+        (0..win.getmaxy()).map(|y| win.is_linetouched(y)).collect()
+    }
+
+    #[test]
+    fn test_touchln_marks_the_lines_inside_the_window() {
+        let mut win = Window::new(5, 3, 0, 0).unwrap();
+        win.untouchwin();
+        win.touchln(1, 2, true);
+        assert_eq!(touched(&win), [false, true, true, false, false]);
+
+        // A range that runs past the last line is cut off there.
+        win.untouchwin();
+        win.touchln(3, 10, true);
+        assert_eq!(touched(&win), [false, false, false, true, true]);
+        win.touchln(3, i32::MAX, false);
+        assert_eq!(touched(&win), [false; 5]);
+    }
+
+    #[test]
+    fn test_touchln_ignores_out_of_range_arguments() {
+        let mut win = Window::new(5, 3, 0, 0).unwrap();
+        win.untouchwin();
+        for (start, count) in [
+            (5, 1),
+            (10, 1),
+            (i32::MAX, i32::MAX),
+            (1, -1),
+            (-1, 2),
+            (0, 0),
+        ] {
+            win.touchln(start, count, true);
+            assert_eq!(touched(&win), [false; 5], "touchln({start}, {count})");
+        }
+    }
+
+    #[test]
+    fn test_resize_keeps_the_scroll_region_inside_the_window() {
+        let mut win = Window::new(10, 3, 0, 0).unwrap();
+        win.scrollok(true);
+        win.setscrreg(5, 9).unwrap();
+        win.resize(3, 3).unwrap();
+        assert_eq!(win.getscrreg(), (2, 2));
+
+        // Scrolling the shrunken region used to panic.
+        for (y, text) in ["aaa", "bbb", "ccc"].into_iter().enumerate() {
+            win.mvaddstr(y as i32, 0, text).unwrap();
+        }
+        win.scrl(1).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "   "]);
+        win.scrl(-1).unwrap();
+        win.scroll_up(1).unwrap();
+        win.scroll_down(1).unwrap();
+    }
+
+    #[test]
+    fn test_resize_keeps_a_scroll_region_that_still_fits() {
+        let mut win = Window::new(10, 3, 0, 0).unwrap();
+        win.setscrreg(1, 3).unwrap();
+        win.resize(6, 3).unwrap();
+        assert_eq!(win.getscrreg(), (1, 3));
+        win.resize(3, 3).unwrap();
+        assert_eq!(win.getscrreg(), (1, 2));
+    }
+
+    #[test]
+    fn test_resize_keeps_a_whole_window_scroll_region_whole() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        assert_eq!(win.getscrreg(), (0, 2));
+        win.resize(5, 3).unwrap();
+        assert_eq!(win.getscrreg(), (0, 4));
+        win.resize(2, 3).unwrap();
+        assert_eq!(win.getscrreg(), (0, 1));
+
+        // The lines added by growing scroll with the rest.
+        win.resize(3, 3).unwrap();
+        for (y, text) in ["aaa", "bbb", "ccc"].into_iter().enumerate() {
+            win.mvaddstr(y as i32, 0, text).unwrap();
+        }
+        win.scroll_up(1).unwrap();
+        assert_eq!(rows(&mut win), ["bbb", "ccc", "   "]);
+    }
+
+    /// A five-line window holding `aaa` to `eee`, with the cursor on `row`.
+    fn five_lines(row: i32) -> Window {
+        let mut win = Window::new(5, 3, 0, 0).unwrap();
+        for (y, text) in ["aaa", "bbb", "ccc", "ddd", "eee"].into_iter().enumerate() {
+            win.mvaddstr(y as i32, 0, text).unwrap();
+        }
+        win.mv(row, 0).unwrap();
+        win
+    }
+
+    #[test]
+    fn test_insertln_inserts_above_the_cursor_line() {
+        let mut win = five_lines(2);
+        win.insertln().unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "   ", "ccc", "ddd"]);
+    }
+
+    #[test]
+    fn test_deleteln_deletes_the_cursor_line() {
+        let mut win = five_lines(2);
+        win.deleteln().unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "ddd", "eee", "   "]);
+    }
+
+    #[test]
+    fn test_insdelln_counts_are_cut_off_at_the_bottom_of_the_window() {
+        let mut win = five_lines(3);
+        win.insdelln(2).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "ccc", "   ", "   "]);
+
+        for n in [100, i32::MAX, -100, i32::MIN] {
+            let mut win = five_lines(1);
+            win.insdelln(n).unwrap();
+            assert_eq!(
+                rows(&mut win),
+                ["aaa", "   ", "   ", "   ", "   "],
+                "insdelln({n})"
+            );
+        }
+
+        let mut win = five_lines(4);
+        win.insdelln(0).unwrap();
+        win.insertln().unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "ccc", "ddd", "   "]);
+    }
+
+    #[test]
+    fn test_insdelln_ignores_the_scroll_region() {
+        let mut win = five_lines(1);
+        win.setscrreg(2, 3).unwrap();
+        win.mv(1, 0).unwrap();
+        win.insdelln(-1).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "ccc", "ddd", "eee", "   "]);
+    }
+
+    #[test]
+    fn test_scrolling_stays_inside_the_scroll_region() {
+        let mut win = five_lines(0);
+        win.setscrreg(1, 3).unwrap();
+        win.scroll_up(1).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "ccc", "ddd", "   ", "eee"]);
+        win.scroll_down(2).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "   ", "   ", "ccc", "eee"]);
+        win.scroll_down(i32::MAX).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "   ", "   ", "   ", "eee"]);
     }
 
     #[test]

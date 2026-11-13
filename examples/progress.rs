@@ -162,27 +162,27 @@ fn draw_frame(screen: &mut Screen, max_y: i32, max_x: i32) -> Result<()> {
 
     // Top border
     screen.mv(box_y, 2)?;
-    screen.addch(ACS_ULCORNER as ChType)?;
+    screen.addch(acs_char(ACS_ULCORNER))?;
     for _ in 0..box_width - 2 {
-        screen.addch(ACS_HLINE as ChType)?;
+        screen.addch(acs_char(ACS_HLINE))?;
     }
-    screen.addch(ACS_URCORNER as ChType)?;
+    screen.addch(acs_char(ACS_URCORNER))?;
 
     // Side borders
     for y in 1..box_height - 1 {
         screen.mv(box_y + y, 2)?;
-        screen.addch(ACS_VLINE as ChType)?;
+        screen.addch(acs_char(ACS_VLINE))?;
         screen.mv(box_y + y, box_width + 1)?;
-        screen.addch(ACS_VLINE as ChType)?;
+        screen.addch(acs_char(ACS_VLINE))?;
     }
 
     // Bottom border
     screen.mv(box_y + box_height - 1, 2)?;
-    screen.addch(ACS_LLCORNER as ChType)?;
+    screen.addch(acs_char(ACS_LLCORNER))?;
     for _ in 0..box_width - 2 {
-        screen.addch(ACS_HLINE as ChType)?;
+        screen.addch(acs_char(ACS_HLINE))?;
     }
-    screen.addch(ACS_LRCORNER as ChType)?;
+    screen.addch(acs_char(ACS_LRCORNER))?;
 
     // Instructions at bottom
     screen.mv(max_y - 2, 2)?;
@@ -208,7 +208,7 @@ fn draw_progress_bar(screen: &mut Screen, y: i32, x: i32, width: i32, percent: f
         screen.attron(attr::color_pair(2))?;
     }
     for _ in 0..filled {
-        screen.addch(ACS_CKBOARD as ChType)?;
+        screen.addch(acs_char(ACS_CKBOARD))?;
     }
     if screen.has_colors() {
         screen.attroff(attr::color_pair(2))?;
