@@ -1343,8 +1343,11 @@ impl Screen {
             if use_keypad && byte == 0x1b {
                 // Start escape sequence parsing
                 self.escape_parser.reset();
-                let result = self.parse_escape_sequence()?;
-                return Ok(result);
+                match self.parse_escape_sequence()? {
+                    Some(result) => return Ok(result),
+                    // A mouse event nobody asked for: keep waiting
+                    None => continue,
+                }
             }
 
             // Handle newline translation
@@ -1357,7 +1360,11 @@ impl Screen {
     }
 
     /// Parse an escape sequence after receiving ESC.
-    fn parse_escape_sequence(&mut self) -> Result<i32> {
+    ///
+    /// Returns the key it stands for, or ESC with the bytes after it handed
+    /// back to be read as ordinary input when it is not a known sequence.
+    /// Returns `None` for a mouse event that the mouse mask filters out.
+    fn parse_escape_sequence(&mut self) -> Result<Option<i32>> {
         self.escape_parser.reset();
         self.escape_parser.feed(0x1b);
 
@@ -1370,21 +1377,14 @@ impl Screen {
         loop {
             // Check timeout
             if start.elapsed() >= escape_timeout {
-                // Timeout - return the accumulated input
-                let input = self.escape_parser.current_input();
-                if input.len() == 1 {
-                    // Just ESC
-                    return Ok(0x1b);
+                // Timeout - return the current match if any, otherwise ESC
+                // with the bytes read after it handed back
+                if sequence_buf.len() > 1
+                    && let Some(key) = self.escape_parser.current_match()
+                {
+                    return Ok(Some(key));
                 }
-                // Return current match if any, otherwise just ESC
-                if let Some(key) = self.escape_parser.current_match() {
-                    return Ok(key);
-                }
-                // Push remaining bytes back to buffer (except ESC which we return)
-                for &b in &input[1..] {
-                    self.input_buffer.push(b as i32);
-                }
-                return Ok(0x1b);
+                return Ok(Some(self.give_back_escape_sequence(&sequence_buf)));
             }
 
             // Check for more input
@@ -1400,9 +1400,9 @@ impl Screen {
                 None => {
                     // EOF during escape - return what we have
                     if let Some(key) = self.escape_parser.current_match() {
-                        return Ok(key);
+                        return Ok(Some(key));
                     }
-                    return Ok(0x1b);
+                    return Ok(Some(self.give_back_escape_sequence(&sequence_buf)));
                 }
             };
 
@@ -1416,39 +1416,47 @@ impl Screen {
                     // Look for terminator
                     if byte == b'M' || byte == b'm' {
                         // Complete mouse sequence
-                        if let Some(event) = parse_sgr_mouse(&sequence_buf) {
-                            self.mouse.push_event(event);
-                            return Ok(KEY_MOUSE);
-                        }
+                        return Ok(match parse_sgr_mouse(&sequence_buf) {
+                            Some(event) if self.mouse.process_event(event) => Some(KEY_MOUSE),
+                            // Not an event the mouse mask asks for
+                            Some(_) => None,
+                            // Not a mouse report after all
+                            None => Some(self.give_back_escape_sequence(&sequence_buf)),
+                        });
                     }
                     // Continue accumulating if not complete
                     if sequence_buf.len() < 20 {
                         // Reasonable max length for mouse sequence
                         continue;
                     }
+                    return Ok(Some(self.give_back_escape_sequence(&sequence_buf)));
                 }
             }
 
             match self.escape_parser.feed(byte) {
                 EscapeMatch::Complete(key) => {
-                    return Ok(key);
+                    return Ok(Some(key));
                 }
                 EscapeMatch::None => {
-                    // No match - return ESC and push rest to buffer
-                    let input = self.escape_parser.current_input();
-                    if input.len() > 1 {
-                        for &b in &input[1..] {
-                            self.input_buffer.push(b as i32);
-                        }
-                    }
-                    self.input_buffer.push(byte as i32);
-                    return Ok(0x1b);
+                    // No match. The parser has already forgotten what it
+                    // was fed, so the bytes come from our own record.
+                    return Ok(Some(self.give_back_escape_sequence(&sequence_buf)));
                 }
                 EscapeMatch::Partial => {
                     // Continue reading
                 }
             }
         }
+    }
+
+    /// Give up on `sequence`, an ESC and the bytes read after it: queue
+    /// those bytes to be read as ordinary input, in order, and return the
+    /// ESC.
+    fn give_back_escape_sequence(&mut self, sequence: &[u8]) -> i32 {
+        for &byte in &sequence[1..] {
+            self.input_buffer.push(byte as i32);
+        }
+        0x1b
     }
 
     /// Push a character back into the input buffer.
@@ -4244,7 +4252,7 @@ impl Screen {
             // Screen to window
             let wy = *y - win.getbegy();
             let wx = *x - win.getbegx();
-            if wy >= 0 && wy <= win.getmaxy() && wx >= 0 && wx <= win.getmaxx() {
+            if wy >= 0 && wy < win.getmaxy() && wx >= 0 && wx < win.getmaxx() {
                 *y = wy;
                 *x = wx;
                 true
@@ -5619,12 +5627,16 @@ mod output_tests {
         }
     }
 
-    /// A screen whose terminal is a file, and what that terminal would show.
+    /// A screen whose terminal is a file for output and a pipe for input,
+    /// and what that terminal would show.
     struct TestScreen {
         // Dropped first: dropping the screen still writes to the file.
         screen: Screen,
         shown: FakeTerminal,
         written: std::fs::File,
+        /// What is written here is what the screen reads as typed.
+        keyboard: std::io::PipeWriter,
+        _keyboard_reader: std::io::PipeReader,
         _terminal_file: tempfile::NamedTempFile,
     }
 
@@ -5634,8 +5646,12 @@ mod output_tests {
 
             let terminal_file = tempfile::NamedTempFile::new().unwrap();
             let written = terminal_file.reopen().unwrap();
-            let fd = terminal_file.as_file().as_raw_fd();
-            let terminal = Terminal::new(fd, fd).unwrap();
+            let (keyboard_reader, keyboard) = std::io::pipe().unwrap();
+            let terminal = Terminal::new(
+                keyboard_reader.as_raw_fd(),
+                terminal_file.as_file().as_raw_fd(),
+            )
+            .unwrap();
             assert!(terminal.is_no_tty());
             let colors = ColorManager::new(8, 64, false);
             let screen = Screen::from_parts(terminal, lines, cols, colors).unwrap();
@@ -5644,6 +5660,8 @@ mod output_tests {
                 screen,
                 shown: FakeTerminal::new(lines as usize, cols as usize),
                 written,
+                keyboard,
+                _keyboard_reader: keyboard_reader,
                 _terminal_file: terminal_file,
             };
             this.show();
@@ -5657,6 +5675,17 @@ mod output_tests {
             self.written.read_to_string(&mut output).unwrap();
             self.shown.feed(&output);
             output
+        }
+
+        /// Type `bytes` at the keyboard.
+        fn type_bytes(&mut self, bytes: &[u8]) {
+            use std::io::Write;
+            self.keyboard.write_all(bytes).unwrap();
+        }
+
+        /// Read `count` keys with `getch`.
+        fn read_keys(&mut self, count: usize) -> Vec<i32> {
+            (0..count).map(|_| self.screen.getch().unwrap()).collect()
         }
 
         /// Refresh the screen and return what the terminal shows.
@@ -5899,6 +5928,130 @@ mod output_tests {
             let last = output.rfind("\x1b[?25").map(|at| &output[at..at + 6]);
             assert_eq!(last, Some(sequence), "{output:?}");
         }
+    }
+
+    /// A screen with keypad mode on and a short escape delay.
+    fn keypad_screen() -> TestScreen {
+        let mut t = TestScreen::new(3, 10);
+        t.screen.stdscr_mut().keypad(true);
+        t.screen.set_escdelay(30);
+        t
+    }
+
+    #[test]
+    fn test_getch_reads_typed_bytes() {
+        let mut t = TestScreen::new(3, 10);
+        t.type_bytes(b"ab\x1b[A");
+        // Without keypad mode an escape sequence is read byte by byte.
+        let keys = [b'a', b'b', 0x1b, b'[', b'A'].map(i32::from);
+        assert_eq!(t.read_keys(5), keys);
+    }
+
+    #[test]
+    fn test_getch_turns_known_escape_sequences_into_keys() {
+        use crate::key::{KEY_SR, KEY_UP};
+
+        let mut t = keypad_screen();
+        t.type_bytes(b"\x1b[A\x1b[1;2Ax");
+        assert_eq!(t.read_keys(3), [KEY_UP, KEY_SR, i32::from(b'x')]);
+    }
+
+    #[test]
+    fn test_getch_hands_back_every_byte_of_an_unknown_escape_sequence() {
+        let mut t = keypad_screen();
+        // Ctrl+Up: not a sequence the parser knows.
+        t.type_bytes(b"\x1b[1;5Ax");
+        let keys = [0x1b, b'[', b'1', b';', b'5', b'A', b'x'].map(i32::from);
+        assert_eq!(t.read_keys(7), keys);
+    }
+
+    #[test]
+    fn test_getch_hands_back_an_escape_sequence_that_stops_short() {
+        let mut t = keypad_screen();
+        t.type_bytes(b"\x1b[1;");
+        assert_eq!(t.read_keys(4), [0x1b, b'[', b'1', b';'].map(i32::from));
+
+        // A lone ESC is the Escape key.
+        t.type_bytes(b"\x1b");
+        assert_eq!(t.read_keys(1), [0x1b]);
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_getch_reports_mouse_events_in_the_order_they_happened() {
+        use crate::mouse::*;
+
+        let mut t = keypad_screen();
+        t.screen.mousemask(ALL_MOUSE_EVENTS);
+        t.screen.mouseinterval(10_000);
+        t.type_bytes(b"\x1b[<0;3;2M\x1b[<0;3;2m");
+        assert_eq!(t.read_keys(2), [KEY_MOUSE, KEY_MOUSE]);
+
+        let press = t.screen.getmouse().unwrap();
+        assert_eq!((press.x, press.y, press.bstate), (2, 1, BUTTON1_PRESSED));
+        // Released straight away: the release is also a click.
+        let release = t.screen.getmouse().unwrap();
+        assert_eq!(release.bstate, BUTTON1_RELEASED | BUTTON1_CLICKED);
+        assert!(t.screen.getmouse().is_none());
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_getch_reports_only_the_mouse_events_asked_for() {
+        use crate::mouse::*;
+
+        let mut t = keypad_screen();
+        t.screen.mousemask(BUTTON1_CLICKED);
+        t.screen.mouseinterval(10_000);
+        t.type_bytes(b"\x1b[<0;3;2M\x1b[<0;3;2mx");
+        // The press is not asked for; the click made by the release is.
+        assert_eq!(t.read_keys(2), [KEY_MOUSE, i32::from(b'x')]);
+        let click = t.screen.getmouse().unwrap();
+        assert_eq!((click.x, click.y, click.bstate), (2, 1, BUTTON1_CLICKED));
+        assert!(t.screen.getmouse().is_none());
+
+        // A press alone is skipped, and the next key is returned.
+        t.type_bytes(b"\x1b[<2;1;1My");
+        assert_eq!(t.read_keys(1), [i32::from(b'y')]);
+        assert!(t.screen.getmouse().is_none());
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_getch_hands_back_a_malformed_mouse_report() {
+        use crate::mouse::ALL_MOUSE_EVENTS;
+
+        let mut t = keypad_screen();
+        t.screen.mousemask(ALL_MOUSE_EVENTS);
+        // Column 0 does not exist: positions start at 1.
+        t.type_bytes(b"\x1b[<0;0;1M");
+        let keys = [0x1b, b'[', b'<', b'0', b';', b'0', b';', b'1', b'M'].map(i32::from);
+        assert_eq!(t.read_keys(9), keys);
+        assert!(t.screen.getmouse().is_none());
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_wmouse_trafo_takes_the_window_edges_into_account() {
+        let t = TestScreen::new(10, 20);
+        let win = t.screen.newwin(3, 4, 2, 5).unwrap();
+        let to_window = |y: i32, x: i32| {
+            let (mut wy, mut wx) = (y, x);
+            t.screen
+                .wmouse_trafo(&win, &mut wy, &mut wx, false)
+                .then_some((wy, wx))
+        };
+        assert_eq!(to_window(2, 5), Some((0, 0)));
+        assert_eq!(to_window(4, 8), Some((2, 3)));
+        // One past the last line or column is outside.
+        assert_eq!(to_window(5, 8), None);
+        assert_eq!(to_window(4, 9), None);
+        assert_eq!(to_window(1, 5), None);
+        assert_eq!(to_window(2, 4), None);
+
+        let (mut y, mut x) = (2, 3);
+        assert!(t.screen.wmouse_trafo(&win, &mut y, &mut x, true));
+        assert_eq!((y, x), (4, 8));
     }
 
     #[test]
