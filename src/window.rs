@@ -1332,8 +1332,8 @@ impl Window {
         }
 
         // Clear the bottom lines
-        for y in (bottom - n + 1)..=bottom {
-            self.lines[y].fill(fill);
+        for line in &mut self.lines[(bottom - n + 1)..=bottom] {
+            line.fill(fill);
         }
 
         Ok(())
@@ -1361,8 +1361,8 @@ impl Window {
         }
 
         // Clear the top lines
-        for y in top..(top + n) {
-            self.lines[y].fill(fill);
+        for line in &mut self.lines[top..(top + n)] {
+            line.fill(fill);
         }
 
         Ok(())
@@ -2169,9 +2169,9 @@ impl Window {
         }
 
         // Left and right edges
-        for y in 1..maxy {
-            self.lines[y].set(0, *ls);
-            self.lines[y].set(maxx, *rs);
+        for line in self.lines.iter_mut().take(maxy).skip(1) {
+            line.set(0, *ls);
+            line.set(maxx, *rs);
         }
 
         self.touchwin();

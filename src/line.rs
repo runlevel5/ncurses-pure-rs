@@ -198,10 +198,8 @@ impl LineData {
     #[cfg(not(feature = "wide"))]
     pub fn fill_range(&mut self, start: usize, end: usize, ch: ChType) {
         let end = end.min(self.text.len());
-        for x in start..end {
-            self.text[x] = ch;
-        }
         if start < end {
+            self.text[start..end].fill(ch);
             self.mark_changed(start);
             self.mark_changed(end - 1);
         }
@@ -211,10 +209,8 @@ impl LineData {
     #[cfg(feature = "wide")]
     pub fn fill_range(&mut self, start: usize, end: usize, ch: CCharT) {
         let end = end.min(self.text.len());
-        for x in start..end {
-            self.text[x] = ch;
-        }
         if start < end {
+            self.text[start..end].fill(ch);
             self.mark_changed(start);
             self.mark_changed(end - 1);
         }
@@ -252,9 +248,7 @@ impl LineData {
         // Shift content right using copy_within (more efficient than manual loop)
         self.text.copy_within(x..width - count, x + count);
         // Insert the character
-        for i in x..(x + count) {
-            self.text[i] = ch;
-        }
+        self.text[x..x + count].fill(ch);
         self.mark_changed(x);
         self.mark_changed(width - 1);
     }
@@ -270,9 +264,7 @@ impl LineData {
         // Shift content right using copy_within (more efficient than manual loop)
         self.text.copy_within(x..width - count, x + count);
         // Insert the character
-        for i in x..(x + count) {
-            self.text[i] = ch;
-        }
+        self.text[x..x + count].fill(ch);
         self.mark_changed(x);
         self.mark_changed(width - 1);
     }
