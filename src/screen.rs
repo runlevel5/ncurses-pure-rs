@@ -5678,6 +5678,31 @@ mod output_tests {
     }
 
     #[test]
+    fn test_standout_is_sent_as_reverse_video() {
+        let mut t = TestScreen::new(2, 10);
+        t.screen.attron(attr::A_STANDOUT).unwrap();
+        t.screen.addstr("S").unwrap();
+        t.screen.attroff(attr::A_STANDOUT).unwrap();
+        t.screen.refresh().unwrap();
+        let output = t.show();
+        let (before, _) = output.split_once('S').unwrap();
+        assert!(before.contains("\x1b[0;7m"), "{output:?}");
+
+        // `standout` and `standend` switch the same attribute.
+        t.screen.stdscr_mut().standout().unwrap();
+        t.screen.addstr("T").unwrap();
+        t.screen.stdscr_mut().standend().unwrap();
+        t.screen.addstr("u").unwrap();
+        t.screen.refresh().unwrap();
+        let output = t.show();
+        let (before, after) = output.split_once('T').unwrap();
+        assert!(before.contains("\x1b[0;7m"), "{output:?}");
+        // Reverse video is switched off again before the next character.
+        let (between, _) = after.split_once('u').unwrap();
+        assert!(between.contains("\x1b[0m"), "{output:?}");
+    }
+
+    #[test]
     fn test_text_after_a_double_width_character_stays_in_its_column() {
         let mut t = TestScreen::new(2, 10);
         t.screen.mvaddstr(0, 0, "日本ab").unwrap();

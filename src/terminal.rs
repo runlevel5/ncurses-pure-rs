@@ -1054,7 +1054,9 @@ impl Terminal {
         if attr & A_BLINK != 0 {
             codes.push(5);
         }
-        if attr & A_REVERSE != 0 {
+        // Standout is shown as reverse video, as terminfo's `smso` does on
+        // the terminals this drives.
+        if attr & (A_REVERSE | A_STANDOUT) != 0 {
             codes.push(7);
         }
         if attr & A_INVIS != 0 {
