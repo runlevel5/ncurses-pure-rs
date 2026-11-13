@@ -210,6 +210,24 @@ impl TrieNode {
 
     /// Find the keycode for a sequence. Returns Some(keycode) if found,
     /// None if not found or only a prefix.
+    /// Remove the key that `sequence` stands for, and say whether there was
+    /// one. Longer sequences that start with it are kept.
+    fn remove_sequence(&mut self, sequence: &[u8]) -> bool {
+        let Some((ch, rest)) = sequence.split_first() else {
+            return self.key_code.take().is_some();
+        };
+        let Some(at) = self.children.iter().position(|(c, _)| c == ch) else {
+            return false;
+        };
+        let child = &mut self.children[at].1;
+        let removed = child.remove_sequence(rest);
+        // A node left with no key and nothing below it serves no purpose
+        if child.key_code.is_none() && child.children.is_empty() {
+            self.children.remove(at);
+        }
+        removed
+    }
+
     fn find_sequence(&self, sequence: &[u8]) -> Option<i32> {
         if sequence.is_empty() {
             return self.key_code.filter(|_| self.enabled);
@@ -438,14 +456,7 @@ impl EscapeParser {
 
         if keycode == 0 {
             // Remove the sequence
-            // Check if it exists first
-            if self.root.find_sequence(sequence).is_some() {
-                // We can't easily remove from a trie, so just disable it
-                // by setting the keycode to None through a remove operation
-                // For now, we'll just return true since we'd need to track this
-                return true;
-            }
-            return false;
+            return self.root.remove_sequence(sequence);
         }
 
         // Check if the sequence is already defined with a different key
@@ -560,8 +571,11 @@ impl std::fmt::Display for InputResult {
             InputResult::Char(ch) => {
                 if (0x20..0x7f).contains(ch) {
                     write!(f, "'{}'", *ch as u8 as char)
-                } else if *ch < 0x20 {
+                } else if (0..0x20).contains(ch) {
                     write!(f, "'^{}'", (*ch as u8 + b'@') as char)
+                } else if *ch < 0 {
+                    // Not a character at all, such as ERR
+                    write!(f, "{ch}")
                 } else {
                     write!(f, "0x{:02x}", ch)
                 }
@@ -580,6 +594,74 @@ impl std::fmt::Display for InputResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_define_key_with_zero_removes_the_sequence() {
+        let mut parser = EscapeParser::new();
+        let sequence = b"\x1b[99~";
+        assert_eq!(parser.key_defined(sequence), -1);
+        assert!(parser.define_key(sequence, 0x1234));
+        assert_eq!(parser.key_defined(sequence), 0x1234);
+
+        assert!(parser.define_key(sequence, 0));
+        assert_eq!(parser.key_defined(sequence), -1);
+        // There is nothing left to remove.
+        assert!(!parser.define_key(sequence, 0));
+        assert!(!parser.define_key(b"\x1b[never~", 0));
+
+        // The sequence can be given a different key afterwards.
+        assert!(parser.define_key(sequence, 0x4321));
+        assert_eq!(parser.key_defined(sequence), 0x4321);
+    }
+
+    #[test]
+    fn test_define_key_removal_keeps_longer_sequences() {
+        let mut parser = EscapeParser::new();
+        assert!(parser.define_key(b"\x1bXY", 0x1001));
+        assert!(parser.define_key(b"\x1bXYZ", 0x1002));
+
+        assert!(parser.define_key(b"\x1bXY", 0));
+        assert_eq!(parser.key_defined(b"\x1bXYZ"), 0x1002);
+        // What is left of the shorter one is only a prefix now.
+        assert_eq!(parser.key_defined(b"\x1bXY"), 0);
+        assert!(!parser.define_key(b"\x1bXY", 0));
+
+        assert!(parser.define_key(b"\x1bXYZ", 0));
+        assert_eq!(parser.key_defined(b"\x1bXYZ"), -1);
+        assert_eq!(parser.key_defined(b"\x1bXY"), -1);
+    }
+
+    #[test]
+    fn test_removed_key_sequence_is_no_longer_recognised() {
+        use crate::key::KEY_UP;
+
+        let mut parser = EscapeParser::new();
+        let feed = |parser: &mut EscapeParser| {
+            parser.reset();
+            b"\x1b[A".iter().map(|b| parser.feed(*b)).last().unwrap()
+        };
+        assert_eq!(feed(&mut parser), EscapeMatch::Complete(KEY_UP));
+        assert!(parser.define_key(b"\x1b[A", 0));
+        assert_eq!(feed(&mut parser), EscapeMatch::None);
+        // Its neighbours are untouched.
+        assert_ne!(parser.key_defined(b"\x1b[B"), -1);
+    }
+
+    #[test]
+    fn test_input_result_display() {
+        for (ch, shown) in [
+            (i32::from(b'A'), "'A'"),
+            (0, "'^@'"),
+            (1, "'^A'"),
+            (0x1f, "'^_'"),
+            (0x7f, "0x7f"),
+            (0x1234, "0x1234"),
+            (-1, "-1"),
+            (i32::MIN, "-2147483648"),
+        ] {
+            assert_eq!(InputResult::Char(ch).to_string(), shown);
+        }
+    }
 
     #[test]
     fn test_input_buffer() {
