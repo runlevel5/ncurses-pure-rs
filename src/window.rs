@@ -1644,71 +1644,78 @@ impl Window {
         bl: ChType,
         br: ChType,
     ) -> Result<()> {
-        // Default characters if 0
-        let ls = if ls == 0 { self.acs_vline() } else { ls };
-        let rs = if rs == 0 { self.acs_vline() } else { rs };
-        let ts = if ts == 0 { self.acs_hline() } else { ts };
-        let bs = if bs == 0 { self.acs_hline() } else { bs };
-        let tl = if tl == 0 { self.acs_ulcorner() } else { tl };
-        let tr = if tr == 0 { self.acs_urcorner() } else { tr };
-        let bl = if bl == 0 { self.acs_llcorner() } else { bl };
-        let br = if br == 0 { self.acs_lrcorner() } else { br };
+        // The default line-drawing characters do not fit in a `ChType`, so
+        // the border is drawn from complex characters.
+        #[cfg(feature = "wide")]
+        {
+            use crate::wide::wacs;
 
-        let maxy = self.maxy as usize;
-        let maxx = self.maxx as usize;
+            let ls = Self::chtype_or(ls, &wacs::VLINE);
+            let rs = Self::chtype_or(rs, &wacs::VLINE);
+            let ts = Self::chtype_or(ts, &wacs::HLINE);
+            let bs = Self::chtype_or(bs, &wacs::HLINE);
+            let tl = Self::chtype_or(tl, &wacs::ULCORNER);
+            let tr = Self::chtype_or(tr, &wacs::URCORNER);
+            let bl = Self::chtype_or(bl, &wacs::LLCORNER);
+            let br = Self::chtype_or(br, &wacs::LRCORNER);
 
-        // Corners
+            self.wborder_set(
+                Some(&ls),
+                Some(&rs),
+                Some(&ts),
+                Some(&bs),
+                Some(&tl),
+                Some(&tr),
+                Some(&bl),
+                Some(&br),
+            )
+        }
         #[cfg(not(feature = "wide"))]
         {
+            // Default characters if 0
+            let ls = if ls == 0 { self.acs_vline() } else { ls };
+            let rs = if rs == 0 { self.acs_vline() } else { rs };
+            let ts = if ts == 0 { self.acs_hline() } else { ts };
+            let bs = if bs == 0 { self.acs_hline() } else { bs };
+            let tl = if tl == 0 { self.acs_ulcorner() } else { tl };
+            let tr = if tr == 0 { self.acs_urcorner() } else { tr };
+            let bl = if bl == 0 { self.acs_llcorner() } else { bl };
+            let br = if br == 0 { self.acs_lrcorner() } else { br };
+
+            let maxy = self.maxy as usize;
+            let maxx = self.maxx as usize;
+
+            // Corners
             self.lines[0].set(0, tl);
             self.lines[0].set(maxx, tr);
             self.lines[maxy].set(0, bl);
             self.lines[maxy].set(maxx, br);
-        }
-        #[cfg(feature = "wide")]
-        {
-            self.set_ch_at(0, 0, tl);
-            self.set_ch_at(0, maxx as i32, tr);
-            self.set_ch_at(maxy as i32, 0, bl);
-            self.set_ch_at(maxy as i32, maxx as i32, br);
-        }
 
-        // Top and bottom edges
-        for x in 1..maxx {
-            #[cfg(not(feature = "wide"))]
-            {
+            // Top and bottom edges
+            for x in 1..maxx {
                 self.lines[0].set(x, ts);
                 self.lines[maxy].set(x, bs);
             }
-            #[cfg(feature = "wide")]
-            {
-                self.set_ch_at(0, x as i32, ts);
-                self.set_ch_at(maxy as i32, x as i32, bs);
-            }
-        }
 
-        // Left and right edges
-        for y in 1..maxy {
-            #[cfg(not(feature = "wide"))]
-            {
-                self.lines[y].set(0, ls);
-                self.lines[y].set(maxx, rs);
+            // Left and right edges
+            for line in self.lines.iter_mut().take(maxy).skip(1) {
+                line.set(0, ls);
+                line.set(maxx, rs);
             }
-            #[cfg(feature = "wide")]
-            {
-                self.set_ch_at(y as i32, 0, ls);
-                self.set_ch_at(y as i32, maxx as i32, rs);
-            }
-        }
 
-        Ok(())
+            Ok(())
+        }
     }
 
+    /// The cell a `ChType` border or line argument stands for: `default`
+    /// when it is 0, otherwise the character and attributes it carries.
     #[cfg(feature = "wide")]
-    fn set_ch_at(&mut self, y: i32, x: i32, ch: ChType) {
-        let c = (ch & A_CHARTEXT) as u8 as char;
-        let attr = ch & !A_CHARTEXT;
-        self.lines[y as usize].set(x as usize, CCharT::from_char_attr(c, attr));
+    fn chtype_or(ch: ChType, default: &CCharT) -> CCharT {
+        if ch == 0 {
+            *default
+        } else {
+            CCharT::from_char_attr((ch & A_CHARTEXT) as u8 as char, ch & !A_CHARTEXT)
+        }
     }
 
     /// How many cells a line of `n` draws when `room` cells are left before
@@ -1722,6 +1729,7 @@ impl Window {
     /// The line starts at the cursor and is at most `n` cells long, cut off
     /// at the window's edge. Nothing is drawn when `n` is zero or negative.
     pub fn hline(&mut self, ch: ChType, n: i32) -> Result<()> {
+        #[cfg(not(feature = "wide"))]
         let ch = if ch == 0 { self.acs_hline() } else { ch };
         let n = Self::line_len(n, (self.maxx - self.curx + 1) as i32);
         let y = self.cury as usize;
@@ -1736,10 +1744,9 @@ impl Window {
         }
         #[cfg(feature = "wide")]
         {
-            // Extract character and attributes, combining with window attributes
-            let c = (ch & A_CHARTEXT) as u8 as char;
-            let attr = (ch & !A_CHARTEXT) | self.attrs;
-            let cchar = CCharT::from_char_attr(c, attr);
+            // The character and its attributes, combined with the window's
+            let mut cchar = Self::chtype_or(ch, &crate::wide::wacs::HLINE);
+            cchar.attr |= self.attrs;
             for i in 0..n {
                 self.lines[y].set(x + i, cchar);
             }
@@ -1753,6 +1760,7 @@ impl Window {
     /// The line starts at the cursor and is at most `n` cells long, cut off
     /// at the window's edge. Nothing is drawn when `n` is zero or negative.
     pub fn vline(&mut self, ch: ChType, n: i32) -> Result<()> {
+        #[cfg(not(feature = "wide"))]
         let ch = if ch == 0 { self.acs_vline() } else { ch };
         let n = Self::line_len(n, (self.maxy - self.cury + 1) as i32);
         let y = self.cury as usize;
@@ -1767,10 +1775,9 @@ impl Window {
         }
         #[cfg(feature = "wide")]
         {
-            // Extract character and attributes, combining with window attributes
-            let c = (ch & A_CHARTEXT) as u8 as char;
-            let attr = (ch & !A_CHARTEXT) | self.attrs;
-            let cchar = CCharT::from_char_attr(c, attr);
+            // The character and its attributes, combined with the window's
+            let mut cchar = Self::chtype_or(ch, &crate::wide::wacs::VLINE);
+            cchar.attr |= self.attrs;
             for i in 0..n {
                 self.lines[y + i].set(x, cchar);
             }
@@ -1817,66 +1824,30 @@ impl Window {
         Ok(())
     }
 
-    // ACS character helpers using Unicode box-drawing characters
+    // ACS character helpers: the VT100 line-drawing codes with A_ALTCHARSET
+    #[cfg(not(feature = "wide"))]
     fn acs_hline(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_HLINE as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_HLINE)
-        }
+        crate::acs::acs_char(crate::acs::ACS_HLINE)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_vline(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_VLINE as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_VLINE)
-        }
+        crate::acs::acs_char(crate::acs::ACS_VLINE)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_ulcorner(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_ULCORNER as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_ULCORNER)
-        }
+        crate::acs::acs_char(crate::acs::ACS_ULCORNER)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_urcorner(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_URCORNER as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_URCORNER)
-        }
+        crate::acs::acs_char(crate::acs::ACS_URCORNER)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_llcorner(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_LLCORNER as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_LLCORNER)
-        }
+        crate::acs::acs_char(crate::acs::ACS_LLCORNER)
     }
+    #[cfg(not(feature = "wide"))]
     fn acs_lrcorner(&self) -> ChType {
-        #[cfg(feature = "wide")]
-        {
-            crate::acs::ACS_LRCORNER as ChType
-        }
-        #[cfg(not(feature = "wide"))]
-        {
-            crate::acs::acs_char(crate::acs::ACS_LRCORNER)
-        }
+        crate::acs::acs_char(crate::acs::ACS_LRCORNER)
     }
 
     // ========================================================================
@@ -2659,6 +2630,7 @@ impl std::fmt::Debug for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attr::{A_BOLD, A_UNDERLINE};
 
     #[test]
     fn test_window_creation() {
@@ -2708,6 +2680,90 @@ mod tests {
                 win.instr(3)
             })
             .collect()
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_default_border_uses_line_drawing_characters() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.box_(0, 0).unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│ │", "└─┘"]);
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.border(0, 0, 0, 0, 0, 0, 0, 0).unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│ │", "└─┘"]);
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.draw_border(crate::types::BorderChars::default())
+            .unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│ │", "└─┘"]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_border_mixes_given_and_default_characters() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.box_('|' as ChType, '-' as ChType).unwrap();
+        assert_eq!(rows(&mut win), ["┌-┐", "| |", "└-┘"]);
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        let (l, r, t, b) = ('l' as ChType, 'r' as ChType, 't' as ChType, 'b' as ChType);
+        win.border(
+            l,
+            r,
+            t,
+            b,
+            '1' as ChType,
+            '2' as ChType,
+            '3' as ChType,
+            '4' as ChType,
+        )
+        .unwrap();
+        assert_eq!(rows(&mut win), ["1t2", "l r", "3b4"]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_border_keeps_the_attributes_of_a_given_character() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.box_('|' as ChType | A_BOLD, 0).unwrap();
+        let side = win.lines[1].get(0);
+        assert_eq!((side.spacing_char(), side.attr), ('|', A_BOLD));
+        // A default character carries no attributes of its own.
+        let top = win.lines[0].get(1);
+        assert_eq!((top.spacing_char(), top.attr), ('─', A_NORMAL));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_default_hline_and_vline_use_line_drawing_characters() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.hline(0, 3).unwrap();
+        win.mv(1, 1).unwrap();
+        win.vline(0, 2).unwrap();
+        assert_eq!(rows(&mut win), ["───", " │ ", " │ "]);
+
+        // The window's attributes apply to the default character too.
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.attron(A_BOLD).unwrap();
+        win.hline(0, 1).unwrap();
+        win.vline('!' as ChType | A_UNDERLINE, 1).unwrap();
+        let cell = win.lines[0].get(0);
+        assert_eq!(
+            (cell.spacing_char(), cell.attr),
+            ('!', A_BOLD | A_UNDERLINE)
+        );
+        win.hline(0, 1).unwrap();
+        let cell = win.lines[0].get(0);
+        assert_eq!((cell.spacing_char(), cell.attr), ('─', A_BOLD));
+    }
+
+    #[test]
+    fn test_border_of_a_one_cell_window_does_not_panic() {
+        for (lines, cols) in [(1, 1), (1, 4), (4, 1), (2, 2)] {
+            let mut win = Window::new(lines, cols, 0, 0).unwrap();
+            win.box_(0, 0).unwrap();
+        }
     }
 
     #[test]
