@@ -416,6 +416,8 @@ impl Field {
         }
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.scroll_row = 0;
+        self.scroll_col = 0;
     }
 
     /// Get field dimensions.
@@ -966,15 +968,47 @@ impl Field {
         self.scroll_col = 0;
     }
 
+    /// Keep the cursor column inside the line the cursor is on.
+    fn clamp_cursor_col(&mut self) {
+        self.cursor_col = self.cursor_col.min(Self::char_len(self.current_line()));
+    }
+
+    /// Where the cursor is in the field's window, as (row, column) from its
+    /// top-left corner. A cursor that is scrolled out of view is reported at
+    /// the nearest edge.
+    fn cursor_in_window(&self) -> (i32, i32) {
+        let offset = |cursor: usize, scroll: usize, size: i32| {
+            let offset = cursor as i64 - scroll as i64;
+            offset.clamp(0, i64::from(size.max(1)) - 1) as i32
+        };
+        (
+            offset(self.cursor_row, self.scroll_row, self.height),
+            offset(self.cursor_col, self.scroll_col, self.width),
+        )
+    }
+
     /// Scroll field forward by n lines.
+    ///
+    /// The cursor moves with the text, so it stays on the same row of the
+    /// field's window.
     pub fn scroll_forward(&mut self, n: usize) {
         let max_scroll = self.buffer.len().saturating_sub(self.height as usize);
-        self.scroll_row = (self.scroll_row + n).min(max_scroll);
+        let scroll_row = self.scroll_row.saturating_add(n).min(max_scroll);
+        let moved = scroll_row.saturating_sub(self.scroll_row);
+        self.scroll_row = scroll_row;
+        self.cursor_row = (self.cursor_row + moved).min(self.buffer.len().saturating_sub(1));
+        self.clamp_cursor_col();
     }
 
     /// Scroll field backward by n lines.
+    ///
+    /// The cursor moves with the text, so it stays on the same row of the
+    /// field's window.
     pub fn scroll_backward(&mut self, n: usize) {
-        self.scroll_row = self.scroll_row.saturating_sub(n);
+        let moved = n.min(self.scroll_row);
+        self.scroll_row -= moved;
+        self.cursor_row = self.cursor_row.saturating_sub(moved);
+        self.clamp_cursor_col();
     }
 
     /// Scroll field forward by a page.
@@ -998,6 +1032,8 @@ impl Field {
     }
 
     /// Scroll field horizontally forward by n columns.
+    ///
+    /// The cursor moves with the text as far as its line reaches.
     pub fn scroll_hforward(&mut self, n: usize) {
         let max_col = self
             .buffer
@@ -1006,12 +1042,20 @@ impl Field {
             .max()
             .unwrap_or(0);
         let max_scroll = max_col.saturating_sub(self.width as usize);
-        self.scroll_col = (self.scroll_col + n).min(max_scroll);
+        let scroll_col = self.scroll_col.saturating_add(n).min(max_scroll);
+        let moved = scroll_col.saturating_sub(self.scroll_col);
+        self.scroll_col = scroll_col;
+        self.cursor_col += moved;
+        self.clamp_cursor_col();
     }
 
     /// Scroll field horizontally backward by n columns.
+    ///
+    /// The cursor moves with the text.
     pub fn scroll_hbackward(&mut self, n: usize) {
-        self.scroll_col = self.scroll_col.saturating_sub(n);
+        let moved = n.min(self.scroll_col);
+        self.scroll_col -= moved;
+        self.cursor_col = self.cursor_col.saturating_sub(moved);
     }
 
     /// Render the field to a window at the field's position.
@@ -1064,15 +1108,8 @@ impl Field {
 
         // Position cursor if this is the current field
         if is_current {
-            let cursor_y = self.row + (self.cursor_row - self.scroll_row) as i32;
-            let cursor_x = self.col + (self.cursor_col - self.scroll_col) as i32;
-            if cursor_y >= self.row
-                && cursor_y < self.row + self.height
-                && cursor_x >= self.col
-                && cursor_x < self.col + self.width
-            {
-                win.mv(cursor_y, cursor_x)?;
-            }
+            let (cursor_row, cursor_col) = self.cursor_in_window();
+            win.mv(self.row + cursor_row, self.col + cursor_col)?;
         }
 
         Ok(())
@@ -1706,14 +1743,9 @@ impl Form {
     pub fn cursor_position(&self) -> Option<(i32, i32)> {
         let field = self.fields.get(self.current)?;
         let f = field.borrow();
-        let (cursor_row, cursor_col) = f.cursor_pos();
-        let scroll_row = f.scroll_row();
-        let scroll_col = f.scroll_col();
+        let (cursor_row, cursor_col) = f.cursor_in_window();
 
-        let screen_row = f.row() + (cursor_row - scroll_row) as i32;
-        let screen_col = f.col() + (cursor_col - scroll_col) as i32;
-
-        Some((screen_row, screen_col))
+        Some((f.row() + cursor_row, f.col() + cursor_col))
     }
 
     /// Check if insert mode is active.
@@ -2611,6 +2643,139 @@ mod tests {
         form.driver(REQ_DEL_PREV).unwrap();
         form.driver(REQ_DEL_PREV).unwrap();
         assert_eq!(form.data()[0], "caf");
+    }
+
+    #[test]
+    fn test_field_scrolling_moves_the_cursor_with_the_text() {
+        let mut field = Field::new(2, 10, 0, 0, 10, 0);
+        field.set_buffer("a\nb\nc\nd");
+
+        field.scroll_forward(1);
+        assert_eq!((field.scroll_row(), field.cursor_row()), (1, 1));
+        assert_eq!(field.cursor_in_window(), (0, 0));
+
+        // Scrolling stops when the last line is in view.
+        field.scroll_forward(10);
+        assert_eq!((field.scroll_row(), field.cursor_row()), (2, 2));
+        field.scroll_forward_page();
+        assert_eq!((field.scroll_row(), field.cursor_row()), (2, 2));
+
+        field.scroll_backward(1);
+        assert_eq!((field.scroll_row(), field.cursor_row()), (1, 1));
+        field.scroll_backward(10);
+        assert_eq!((field.scroll_row(), field.cursor_row()), (0, 0));
+
+        // A cursor on the second row of the window stays there.
+        field.cursor_down();
+        field.scroll_forward(2);
+        assert_eq!((field.scroll_row(), field.cursor_row()), (2, 3));
+        assert_eq!(field.cursor_in_window(), (1, 0));
+        field.scroll_backward_page();
+        assert_eq!((field.scroll_row(), field.cursor_row()), (0, 1));
+    }
+
+    #[test]
+    fn test_field_scrolling_keeps_the_cursor_inside_its_line() {
+        let mut field = Field::new(1, 10, 0, 0, 3, 0);
+        field.set_buffer("abcdef\nx");
+        field.cursor_line_end();
+        field.scroll_forward(1);
+        assert_eq!(field.cursor_pos(), (1, 1));
+
+        // Typing after a scroll lands where the cursor is shown.
+        field.insert_char('y');
+        assert_eq!(field.buffer(), "abcdef\nxy");
+    }
+
+    #[test]
+    fn test_field_horizontal_scrolling_moves_the_cursor_with_the_text() {
+        let mut field = Field::new(1, 3, 0, 0, 0, 0);
+        field.set_buffer("abcdefgh");
+
+        field.scroll_hforward(2);
+        assert_eq!((field.scroll_col(), field.cursor_col()), (2, 2));
+        assert_eq!(field.cursor_in_window(), (0, 0));
+        field.scroll_hforward(100);
+        assert_eq!((field.scroll_col(), field.cursor_col()), (5, 5));
+        field.scroll_hbackward(1);
+        assert_eq!((field.scroll_col(), field.cursor_col()), (4, 4));
+        field.scroll_hbackward(100);
+        assert_eq!((field.scroll_col(), field.cursor_col()), (0, 0));
+    }
+
+    #[test]
+    fn test_field_cursor_scrolled_out_of_view_is_shown_at_the_edge() {
+        // The cursor's line is shorter than the horizontal scroll offset.
+        let mut field = Field::new(2, 3, 0, 0, 0, 0);
+        field.set_buffer("abcdefgh\nxy");
+        field.cursor_down();
+        field.scroll_hforward(4);
+        assert_eq!(field.scroll_col(), 4);
+        assert_eq!(field.cursor_pos(), (1, 2));
+        assert_eq!(field.cursor_in_window(), (1, 0));
+
+        let mut win = Window::new(5, 10, 0, 0).unwrap();
+        field.render(&mut win, true).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 0));
+    }
+
+    #[test]
+    fn test_field_set_buffer_resets_scrolling() {
+        let mut field = Field::new(2, 3, 0, 0, 10, 0);
+        field.set_buffer("abcdefgh\nb\nc\nd");
+        field.scroll_forward(2);
+        field.scroll_hforward(2);
+        field.set_buffer("x");
+        assert_eq!((field.scroll_row(), field.scroll_col()), (0, 0));
+        assert_eq!(field.cursor_in_window(), (0, 0));
+    }
+
+    #[test]
+    fn test_form_scroll_requests_keep_the_cursor_position_valid() {
+        let requests = [
+            REQ_SCR_FLINE,
+            REQ_SCR_BLINE,
+            REQ_SCR_FPAGE,
+            REQ_SCR_BPAGE,
+            REQ_SCR_FHPAGE,
+            REQ_SCR_BHPAGE,
+            REQ_SCR_FCHAR,
+            REQ_SCR_BCHAR,
+            REQ_SCR_HFLINE,
+            REQ_SCR_HBLINE,
+            REQ_SCR_HFHALF,
+            REQ_SCR_HBHALF,
+        ];
+        let mut win = Window::new(10, 30, 0, 0).unwrap();
+
+        for first in requests {
+            for second in requests {
+                let mut form = Form::new(vec![Field::new(2, 5, 1, 2, 10, 0)]);
+                let field = form.current_field().unwrap();
+                field.borrow_mut().set_buffer("a\nlonger line\nc\nd\ne");
+
+                for request in [first, second, first] {
+                    form.driver(request).unwrap();
+                    let (y, x) = form.cursor_position().unwrap();
+                    assert!((1..3).contains(&y) && (2..7).contains(&x), "({y}, {x})");
+                    form.render_to(&mut win).unwrap();
+                    assert_eq!((win.getcury(), win.getcurx()), (y, x));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_form_scroll_then_render_does_not_panic() {
+        let mut form = Form::new(vec![Field::new(2, 10, 0, 0, 10, 0)]);
+        let field = form.current_field().unwrap();
+        field.borrow_mut().set_buffer("a\nb\nc\nd");
+
+        form.driver(REQ_SCR_FLINE).unwrap();
+        assert_eq!(form.cursor_position(), Some((0, 0)));
+        let mut win = Window::new(5, 20, 0, 0).unwrap();
+        form.render_to(&mut win).unwrap();
+        assert_eq!(field.borrow().cursor_row(), 1);
     }
 
     #[test]
