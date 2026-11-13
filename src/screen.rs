@@ -834,7 +834,27 @@ impl Screen {
                 }
             }
         }
+
+        // Everything changed is now on its way to the terminal.
+        self.stdscr.untouchwin();
+        let (leaveok, cury, curx) = (
+            self.stdscr.is_leaveok(),
+            self.stdscr.getcury(),
+            self.stdscr.getcurx(),
+        );
+        self.set_cursor_after_update(leaveok, cury, curx);
         Ok(())
+    }
+
+    /// Record where the next `doupdate` leaves the terminal's cursor: at
+    /// (`y`, `x`) on the screen, or wherever it ends up when `leaveok` is set
+    /// on the window that was refreshed last.
+    fn set_cursor_after_update(&mut self, leaveok: bool, y: i32, x: i32) {
+        self.newscr.leaveok(leaveok);
+        if !leaveok {
+            // A cursor outside the screen is left where it was.
+            let _ = self.newscr.mv(y, x);
+        }
     }
 
     /// Refresh a window (copy to physical screen).
@@ -846,7 +866,10 @@ impl Screen {
     }
 
     /// Copy a window to the virtual screen (but don't update physical screen).
-    pub fn wnoutrefresh(&mut self, win: &Window) -> Result<()> {
+    ///
+    /// The window's changes are then marked as dealt with, and the next
+    /// `doupdate` leaves the cursor at this window's cursor.
+    pub fn wnoutrefresh(&mut self, win: &mut Window) -> Result<()> {
         // Copy changed portions of win to newscr
         let begy = win.getbegy();
         let begx = win.getbegx();
@@ -875,6 +898,9 @@ impl Screen {
                 }
             }
         }
+
+        win.untouchwin();
+        self.set_cursor_after_update(win.is_leaveok(), begy + win.getcury(), begx + win.getcurx());
 
         Ok(())
     }
@@ -1006,11 +1032,10 @@ impl Screen {
             self.terminal.set_attributes(A_NORMAL)?;
         }
 
-        // Position cursor at stdscr's cursor position
-        let cursor_y = self.stdscr.getcury();
-        let cursor_x = self.stdscr.getcurx();
-        if !self.stdscr.is_leaveok() {
-            self.terminal.move_cursor(cursor_y, cursor_x)?;
+        // Position the cursor at the cursor of the window refreshed last
+        if !self.newscr.is_leaveok() {
+            self.terminal
+                .move_cursor(self.newscr.getcury(), self.newscr.getcurx())?;
         }
 
         // Flush output
@@ -1028,9 +1053,6 @@ impl Screen {
                 newscr_line.untouch();
             }
         }
-
-        // Clear touch flags on stdscr
-        self.stdscr.untouchwin();
 
         Ok(())
     }
@@ -5675,6 +5697,78 @@ mod output_tests {
         t.screen.addch(acs_char(ACS_DARROW) | attr::A_BOLD).unwrap();
         let output_rows = t.refresh();
         assert_eq!(output_rows, ["┌─┐", "▒▒▒", " ↓"]);
+    }
+
+    #[test]
+    fn test_wrefresh_leaves_the_cursor_at_the_window_cursor() {
+        let mut t = TestScreen::new(5, 20);
+        let mut win = t.screen.newwin(2, 5, 1, 10).unwrap();
+        win.mvaddstr(0, 0, "ab").unwrap();
+        win.mv(1, 2).unwrap();
+        t.wrefresh(&mut win);
+        assert_eq!((t.shown.y, t.shown.x), (2, 12));
+
+        // Refreshing the standard screen puts it back at that one's cursor.
+        t.screen.mv(4, 3).unwrap();
+        t.refresh();
+        assert_eq!((t.shown.y, t.shown.x), (4, 3));
+    }
+
+    #[test]
+    fn test_wrefresh_with_leaveok_leaves_the_cursor_after_the_output() {
+        let mut t = TestScreen::new(5, 20);
+        let mut win = t.screen.newwin(2, 5, 1, 10).unwrap();
+        win.leaveok(true);
+        win.mvaddstr(0, 0, "ab").unwrap();
+        win.mv(1, 4).unwrap();
+        t.wrefresh(&mut win);
+        assert_eq!((t.shown.y, t.shown.x), (1, 12));
+    }
+
+    #[test]
+    fn test_wrefresh_marks_the_window_as_dealt_with() {
+        let mut t = TestScreen::new(4, 10);
+        let mut win = t.screen.newwin(2, 5, 1, 1).unwrap();
+        win.mvaddstr(0, 0, "win").unwrap();
+        assert!(win.is_wintouched());
+        t.wrefresh(&mut win);
+        assert!(!win.is_wintouched());
+
+        // The standard screen draws over the window. Refreshing the
+        // unchanged window again does not bring its old text back.
+        t.screen.mvaddstr(1, 0, "stdscr").unwrap();
+        assert_eq!(t.refresh()[1], "stdscr");
+        assert_eq!(t.wrefresh(&mut win)[1], "stdscr");
+    }
+
+    #[test]
+    fn test_wrefresh_keeps_the_changes_waiting_on_the_standard_screen() {
+        let mut t = TestScreen::new(4, 12);
+        let mut win = t.screen.newwin(1, 3, 2, 0).unwrap();
+        win.addstr("win").unwrap();
+
+        // Written but not refreshed yet.
+        t.screen.mvaddstr(0, 0, "waiting").unwrap();
+        assert_eq!(t.wrefresh(&mut win), ["", "", "win", ""]);
+        assert_eq!(t.refresh(), ["waiting", "", "win", ""]);
+    }
+
+    #[test]
+    fn test_doupdate_shows_every_window_copied_with_wnoutrefresh() {
+        let mut t = TestScreen::new(3, 10);
+        let mut first = t.screen.newwin(1, 3, 0, 0).unwrap();
+        let mut second = t.screen.newwin(1, 3, 2, 4).unwrap();
+        first.addstr("one").unwrap();
+        second.addstr("tw").unwrap();
+        t.screen.wnoutrefresh(&mut first).unwrap();
+        t.screen.wnoutrefresh(&mut second).unwrap();
+        assert!(t.show().is_empty());
+
+        t.screen.doupdate().unwrap();
+        t.show();
+        assert_eq!(t.shown.rows(), ["one", "", "    tw"]);
+        // The cursor is where the last window copied has its cursor.
+        assert_eq!((t.shown.y, t.shown.x), (2, 6));
     }
 
     #[test]
