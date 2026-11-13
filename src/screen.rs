@@ -168,6 +168,9 @@ impl Screen {
         screen.cbreak()?;
         screen.noecho()?;
 
+        // This is the program mode that `reset_prog_mode` comes back to
+        screen.terminal.save_prog_mode()?;
+
         // Clear the screen
         screen.terminal.clear_screen()?;
         screen.terminal.flush()?;
@@ -6097,6 +6100,34 @@ mod output_tests {
         let (mut y, mut x) = (2, 3);
         assert!(t.screen.wmouse_trafo(&win, &mut y, &mut x, true));
         assert_eq!((y, x), (4, 8));
+    }
+
+    #[test]
+    fn test_reset_prog_mode_comes_back_to_the_modes_set_at_start() {
+        use crate::terminal::tty_tests::{local_flags, open_pty};
+        use std::os::fd::AsRawFd;
+
+        let pty = open_pty();
+        let fd = pty.terminal_side.as_raw_fd();
+        let terminal = Terminal::new(fd, fd).unwrap();
+        let colors = ColorManager::new(8, 64, false);
+        let mut screen = Screen::from_parts(terminal, 5, 20, colors).unwrap();
+        // A screen starts in cbreak mode without echo.
+        assert_eq!(local_flags(fd) & (libc::ICANON | libc::ECHO), 0);
+
+        // Out to a shell, which gets its own settings back.
+        screen.reset_shell_mode().unwrap();
+        assert_ne!(local_flags(fd) & (libc::ICANON | libc::ECHO), 0);
+        // Back: not the shell's cooked, echoing mode.
+        screen.reset_prog_mode().unwrap();
+        assert_eq!(local_flags(fd) & (libc::ICANON | libc::ECHO), 0);
+
+        // A mode recorded later is the one that comes back.
+        screen.echo().unwrap();
+        screen.def_prog_mode().unwrap();
+        screen.noecho().unwrap();
+        screen.reset_prog_mode().unwrap();
+        assert_ne!(local_flags(fd) & libc::ECHO, 0);
     }
 
     #[test]
