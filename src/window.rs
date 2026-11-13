@@ -2299,12 +2299,20 @@ impl Window {
         }
     }
 
-    /// Mark a range of lines as changed.
+    /// Mark `count` lines from `start` as changed or unchanged.
+    ///
+    /// Lines past the end of the window are ignored. Nothing happens when
+    /// `start` or `count` is negative, or `start` is past the last line.
     pub fn touchln(&mut self, start: i32, count: i32, changed: bool) {
-        let start = start.max(0) as usize;
-        let end = (start + count as usize).min(self.lines.len());
+        let (Ok(start), Ok(count)) = (usize::try_from(start), usize::try_from(count)) else {
+            return;
+        };
+        let end = start.saturating_add(count).min(self.lines.len());
+        let Some(lines) = self.lines.get_mut(start..end) else {
+            return;
+        };
 
-        for line in &mut self.lines[start..end] {
+        for line in lines {
             if changed {
                 line.touch();
             } else {
@@ -2721,6 +2729,43 @@ mod tests {
         win.hline('-' as ChType, 10).unwrap();
         win.vline('|' as ChType, 10).unwrap();
         assert_eq!(rows(&mut win), ["   ", " |-", " | "]);
+    }
+
+    /// Which lines of the window are marked as changed.
+    fn touched(win: &Window) -> Vec<bool> {
+        (0..win.getmaxy()).map(|y| win.is_linetouched(y)).collect()
+    }
+
+    #[test]
+    fn test_touchln_marks_the_lines_inside_the_window() {
+        let mut win = Window::new(5, 3, 0, 0).unwrap();
+        win.untouchwin();
+        win.touchln(1, 2, true);
+        assert_eq!(touched(&win), [false, true, true, false, false]);
+
+        // A range that runs past the last line is cut off there.
+        win.untouchwin();
+        win.touchln(3, 10, true);
+        assert_eq!(touched(&win), [false, false, false, true, true]);
+        win.touchln(3, i32::MAX, false);
+        assert_eq!(touched(&win), [false; 5]);
+    }
+
+    #[test]
+    fn test_touchln_ignores_out_of_range_arguments() {
+        let mut win = Window::new(5, 3, 0, 0).unwrap();
+        win.untouchwin();
+        for (start, count) in [
+            (5, 1),
+            (10, 1),
+            (i32::MAX, i32::MAX),
+            (1, -1),
+            (-1, 2),
+            (0, 0),
+        ] {
+            win.touchln(start, count, true);
+            assert_eq!(touched(&win), [false; 5], "touchln({start}, {count})");
+        }
     }
 
     #[test]
