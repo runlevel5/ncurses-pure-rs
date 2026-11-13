@@ -893,6 +893,8 @@ impl Window {
             return Ok(());
         }
 
+        let ch = self.render(ch);
+
         // Handle wide characters (2-column)
         let width = ch.width();
         let columns = self.maxx as usize + 1;
@@ -930,6 +932,27 @@ impl Window {
         }
 
         Ok(())
+    }
+
+    /// What `ch` becomes when it is written to this window: it takes on the
+    /// background's attributes, and its colour unless it has one of its own.
+    /// A blank with no attributes of its own becomes the background
+    /// character.
+    #[cfg(feature = "wide")]
+    fn render(&self, mut ch: CCharT) -> CCharT {
+        let background = &self.bkgrnd;
+        if ch.spacing_char() == ' ' && ch.char_count() == 1 && ch.attr & !self.attrs == 0 {
+            ch.chars = background.chars;
+        }
+        if ch.attr & attr::A_COLOR == 0 {
+            ch.attr |= background.attr & attr::A_COLOR;
+            #[cfg(feature = "ext-colors")]
+            if ch.ext_color == 0 {
+                ch.ext_color = background.ext_color;
+            }
+        }
+        ch.attr |= background.attr & !attr::A_COLOR;
+        ch
     }
 
     /// Attach a combining character to the character before the cursor.
@@ -1542,9 +1565,7 @@ impl Window {
     /// Set the background and apply to entire window (wide character version).
     #[cfg(feature = "wide")]
     pub fn bkgd(&mut self, ch: ChType) -> Result<()> {
-        self.bkgrnd = CCharT::from_chtype(ch);
-        // For simplicity, just set background without full update
-        Ok(())
+        self.wbkgrnd(&CCharT::from_chtype(ch))
     }
 
     // ========================================================================
@@ -2258,21 +2279,26 @@ impl Window {
         // Update all cells
         for line in &mut self.lines {
             for x in 0..line.width() {
-                let cell = line.get(x);
+                let mut cell = line.get(x);
                 let cell_char = cell.spacing_char();
-                let cell_attr = cell.attrs();
 
                 // Replace old background char with new
-                let updated_char = if cell_char == old_char || cell_char == ' ' {
-                    new_char
+                if cell_char == old_char || cell_char == ' ' {
+                    cell.chars[0] = new_char;
+                }
+
+                // Update attributes: remove old background attrs, add new
+                // ones. A cell in the old background's colour takes the new
+                // one; a cell with a colour of its own keeps it.
+                let color = attr::A_COLOR;
+                let cell_color = if cell.attr & color == old_attr & color {
+                    new_attr & color
                 } else {
-                    cell_char
+                    cell.attr & color
                 };
+                cell.attr = (cell.attr & !color & !old_attr) | (new_attr & !color) | cell_color;
 
-                // Update attributes: remove old background attrs, add new ones
-                let updated_attr = (cell_attr & !old_attr) | new_attr;
-
-                line.set(x, CCharT::from_char_attr(updated_char, updated_attr));
+                line.set(x, cell);
             }
         }
 
@@ -2904,6 +2930,104 @@ mod tests {
         assert_eq!(win.getbkgd(), acs_char(ACS_BOARD));
         win.erase().unwrap();
         assert_eq!(rows_of(&mut win, 2), ["▓▓"]);
+    }
+
+    /// The character and attributes of a cell.
+    #[cfg(feature = "wide")]
+    fn cell(win: &Window, y: usize, x: usize) -> (char, AttrT) {
+        let cell = win.lines[y].get(x);
+        (cell.spacing_char(), cell.attr)
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_bkgd_repaints_the_window() {
+        let mut win = Window::new(2, 3, 0, 0).unwrap();
+        win.addstr("ab").unwrap();
+        win.bkgd('.' as ChType | A_BOLD).unwrap();
+        assert_eq!(rows(&mut win), ["ab.", "..."]);
+        assert_eq!(cell(&win, 0, 0), ('a', A_BOLD));
+        assert_eq!(cell(&win, 1, 2), ('.', A_BOLD));
+        assert_eq!(win.getbkgd(), '.' as ChType | A_BOLD);
+        win.mv(0, 2).unwrap();
+        assert_eq!(win.inch(), '.' as ChType | A_BOLD);
+        assert!(win.is_wintouched());
+
+        // A new background replaces the old one's character and attributes.
+        win.bkgd(' ' as ChType | A_UNDERLINE).unwrap();
+        assert_eq!(rows(&mut win), ["ab ", "   "]);
+        assert_eq!(cell(&win, 0, 0), ('a', A_UNDERLINE));
+        assert_eq!(cell(&win, 1, 2), (' ', A_UNDERLINE));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_characters_added_after_bkgd_take_the_background_attributes() {
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        win.bkgd('.' as ChType | A_BOLD).unwrap();
+        win.addch('z' as ChType).unwrap();
+        // A plain blank becomes the background character.
+        win.addch(' ' as ChType).unwrap();
+        // A blank with attributes of its own stays a blank.
+        win.addch(' ' as ChType | A_UNDERLINE).unwrap();
+        assert_eq!(cell(&win, 0, 0), ('z', A_BOLD));
+        assert_eq!(cell(&win, 0, 1), ('.', A_BOLD));
+        assert_eq!(cell(&win, 0, 2), (' ', A_BOLD | A_UNDERLINE));
+        assert_eq!(cell(&win, 0, 3), ('.', A_BOLD));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_background_colour_applies_unless_a_character_has_its_own() {
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        win.addch('a' as ChType | color_pair(3)).unwrap();
+        win.bkgd(' ' as ChType | color_pair(2)).unwrap();
+        win.addch('b' as ChType).unwrap();
+        win.addch('c' as ChType | color_pair(3) | A_BOLD).unwrap();
+        assert_eq!(cell(&win, 0, 0), ('a', color_pair(3)));
+        assert_eq!(cell(&win, 0, 1), ('b', color_pair(2)));
+        assert_eq!(cell(&win, 0, 2), ('c', color_pair(3) | A_BOLD));
+        assert_eq!(cell(&win, 0, 3), (' ', color_pair(2)));
+
+        // Changing the background colour recolours what had the old one.
+        win.bkgd(' ' as ChType | color_pair(5)).unwrap();
+        assert_eq!(cell(&win, 0, 0), ('a', color_pair(3)));
+        assert_eq!(cell(&win, 0, 1), ('b', color_pair(5)));
+        assert_eq!(cell(&win, 0, 3), (' ', color_pair(5)));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_bkgdset_only_affects_what_is_written_afterwards() {
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addch('a' as ChType).unwrap();
+        win.bkgdset('.' as ChType | A_BOLD);
+        assert_eq!(cell(&win, 0, 0), ('a', A_NORMAL));
+        assert_eq!(cell(&win, 0, 1), (' ', A_NORMAL));
+        win.addstr("b ").unwrap();
+        assert_eq!(cell(&win, 0, 1), ('b', A_BOLD));
+        assert_eq!(cell(&win, 0, 2), ('.', A_BOLD));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_bkgd_keeps_combining_characters() {
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addstr("e\u{301}").unwrap();
+        win.bkgd(' ' as ChType | A_BOLD).unwrap();
+        assert_eq!(win.lines[0].get(0).to_string(), "e\u{301}");
+        assert_eq!(cell(&win, 0, 0), ('e', A_BOLD));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_window_without_a_background_writes_characters_unchanged() {
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.attron(A_UNDERLINE).unwrap();
+        win.addch('a' as ChType | A_BOLD).unwrap();
+        win.addch(' ' as ChType).unwrap();
+        assert_eq!(cell(&win, 0, 0), ('a', A_BOLD | A_UNDERLINE));
+        assert_eq!(cell(&win, 0, 1), (' ', A_UNDERLINE));
     }
 
     #[test]
