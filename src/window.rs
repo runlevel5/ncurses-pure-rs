@@ -801,11 +801,7 @@ impl Window {
             b'\n' => {
                 // Newline: clear to end of line and move to next line
                 self.clrtoeol()?;
-                if self.cury < self.maxy {
-                    self.cury += 1;
-                    self.curx = 0;
-                } else if self.scroll {
-                    self.scroll_up(1)?;
+                if self.next_line()? {
                     self.curx = 0;
                 }
                 return Ok(());
@@ -860,11 +856,7 @@ impl Window {
         match c {
             '\n' => {
                 self.clrtoeol()?;
-                if self.cury < self.maxy {
-                    self.cury += 1;
-                    self.curx = 0;
-                } else if self.scroll {
-                    self.scroll_up(1)?;
+                if self.next_line()? {
                     self.curx = 0;
                 }
                 return Ok(());
@@ -929,18 +921,36 @@ impl Window {
     fn advance_cursor(&mut self) -> Result<()> {
         self.curx += 1;
         if self.curx > self.maxx {
-            self.curx = 0;
             self.flags |= WindowFlags::WRAPPED;
-            if self.cury < self.maxy {
-                self.cury += 1;
-            } else if self.scroll {
-                self.scroll_up(1)?;
+            if self.next_line()? {
+                self.curx = 0;
             } else {
-                // Stay at bottom-right
+                // Stay at the right edge
                 self.curx = self.maxx;
             }
         }
         Ok(())
+    }
+
+    /// Move the cursor down a line, as a newline or a wrap at the right edge
+    /// does, and say whether it moved.
+    ///
+    /// On the last line of the scroll region the region scrolls up instead
+    /// and the cursor stays on that line, if scrolling is enabled. Without
+    /// scrolling the cursor does not move from there, nor from the last line
+    /// of the window.
+    fn next_line(&mut self) -> Result<bool> {
+        if self.cury == self.regbottom {
+            if !self.scroll {
+                return Ok(false);
+            }
+            self.scroll_up(1)?;
+        } else if self.cury < self.maxy {
+            self.cury += 1;
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Add a string at the current position.
@@ -3035,6 +3045,79 @@ mod tests {
         win.mv(1, 0).unwrap();
         win.insdelln(-1).unwrap();
         assert_eq!(rows(&mut win), ["aaa", "ccc", "ddd", "eee", "   "]);
+    }
+
+    #[test]
+    fn test_newline_on_the_last_line_of_the_scroll_region_scrolls_it() {
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(2, 2).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        // The rest of the line is cleared, the region scrolls, and the
+        // cursor stays on the region's last line.
+        assert_eq!(rows(&mut win), ["aaa", "cc ", "   ", "ddd", "eee"]);
+
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(2, 2).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (2, 0));
+    }
+
+    #[test]
+    fn test_wrapping_on_the_last_line_of_the_scroll_region_scrolls_it() {
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(2, 2).unwrap();
+        win.addstr("XY").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (2, 1));
+        assert_eq!(rows(&mut win), ["aaa", "ccX", "Y  ", "ddd", "eee"]);
+    }
+
+    #[test]
+    fn test_newline_outside_the_scroll_region_moves_down_without_scrolling() {
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+
+        // Above the region.
+        win.mv(0, 3 - 1).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 0));
+
+        // Below it: down to the last line of the window, and no further.
+        win.mv(3, 2).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (4, 0));
+        win.mv(4, 2).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (4, 2));
+        assert_eq!(rows(&mut win), ["aa ", "bbb", "ccc", "dd ", "ee "]);
+    }
+
+    #[test]
+    fn test_newline_at_the_scroll_region_bottom_without_scrollok_stays_put() {
+        let mut win = five_lines(0);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(2, 1).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (2, 1));
+        win.mv(2, 2).unwrap();
+        win.addstr("XY").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (2, 2));
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "c Y", "ddd", "eee"]);
+    }
+
+    #[test]
+    fn test_newline_scrolls_a_window_with_the_default_scroll_region() {
+        let mut win = Window::new(2, 3, 0, 0).unwrap();
+        win.scrollok(true);
+        win.addstr("ab\ncd\nef").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 2));
+        assert_eq!(rows(&mut win), ["cd ", "ef "]);
     }
 
     #[test]
