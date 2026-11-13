@@ -1325,14 +1325,18 @@ impl Window {
         #[cfg(feature = "wide")]
         let fill = self.bkgrnd;
 
+        // The first line that is cleared rather than shifted into. When the
+        // whole region scrolls away this is `top`, and nothing is shifted.
+        let first_cleared = bottom + 1 - n;
+
         // Shift lines up - clone source lines first to avoid borrow issues
-        for y in top..=(bottom - n) {
+        for y in top..first_cleared {
             let src_line = self.lines[y + n].clone();
             self.lines[y].copy_from(&src_line);
         }
 
         // Clear the bottom lines
-        for line in &mut self.lines[(bottom - n + 1)..=bottom] {
+        for line in &mut self.lines[first_cleared..=bottom] {
             line.fill(fill);
         }
 
@@ -2662,5 +2666,44 @@ mod tests {
         win.scrollok(true);
         win.scroll_up(1).unwrap();
         assert!(win.is_wintouched());
+    }
+
+    /// The text of every line of a three-column window.
+    fn rows(win: &mut Window) -> Vec<String> {
+        (0..win.getmaxy())
+            .map(|y| {
+                win.mv(y, 0).unwrap();
+                win.instr(3)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_scroll_up_shifts_lines() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        for (y, text) in ["aaa", "bbb", "ccc"].into_iter().enumerate() {
+            win.mvaddstr(y as i32, 0, text).unwrap();
+        }
+        win.scroll_up(1).unwrap();
+        assert_eq!(rows(&mut win), ["bbb", "ccc", "   "]);
+    }
+
+    #[test]
+    fn test_scroll_up_whole_region_clears_it() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        for (y, text) in ["aaa", "bbb", "ccc"].into_iter().enumerate() {
+            win.mvaddstr(y as i32, 0, text).unwrap();
+        }
+        // More than the region holds: clamped to the whole region.
+        win.scroll_up(5).unwrap();
+        assert_eq!(rows(&mut win), ["   ", "   ", "   "]);
+    }
+
+    #[test]
+    fn test_scroll_up_one_line_window() {
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.mvaddstr(0, 0, "aaa").unwrap();
+        win.scroll_up(1).unwrap();
+        assert_eq!(rows(&mut win), ["   "]);
     }
 }
