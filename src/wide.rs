@@ -4,8 +4,8 @@
 //! and combining characters to be displayed. This matches the X/Open XSI
 //! Curses wide character extensions.
 
-use crate::attr::{A_CHARTEXT, A_NORMAL};
-use crate::types::{AttrT, CCHARW_MAX};
+use crate::attr::{A_ALTCHARSET, A_CHARTEXT, A_NORMAL};
+use crate::types::{AttrT, CCHARW_MAX, ChType};
 use std::fmt;
 
 /// Complex character type for wide character support.
@@ -49,6 +49,39 @@ impl CCharT {
             #[cfg(feature = "ext-colors")]
             ext_color: 0,
         }
+    }
+
+    /// The complex character a `ChType` stands for: the character in its low
+    /// byte, with its attributes.
+    ///
+    /// A VT100 line-drawing code with `A_ALTCHARSET`, as
+    /// [`acs_char`](crate::acs::acs_char) returns, becomes the line-drawing
+    /// character itself, and `A_ALTCHARSET` is dropped.
+    pub fn from_chtype(ch: ChType) -> Self {
+        let byte = (ch & A_CHARTEXT) as u8;
+        let attr = ch & !A_CHARTEXT;
+        if attr & A_ALTCHARSET != 0
+            && let Some(acs) = crate::acs::acs_unicode(byte)
+        {
+            return Self::from_char_attr(acs, attr & !A_ALTCHARSET);
+        }
+        Self::from_char_attr(byte as char, attr)
+    }
+
+    /// This character as a `ChType`, the reverse of
+    /// [`from_chtype`](Self::from_chtype).
+    ///
+    /// A line-drawing character comes back as its VT100 code with
+    /// `A_ALTCHARSET`. Any other character that does not fit in the low byte
+    /// of a `ChType` is cut down to its low byte.
+    pub fn to_chtype(&self) -> ChType {
+        let c = self.spacing_char();
+        if u32::from(c) > 0xFF
+            && let Some(acs) = crate::acs::acs_chtype(c)
+        {
+            return acs | self.attr;
+        }
+        ChType::from(c as u8) | self.attr
     }
 
     /// Create a complex character from a single character with default attributes.
@@ -267,6 +300,57 @@ pub mod wacs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cchar_from_chtype() {
+        use crate::acs::{ACS_HLINE, acs_char};
+        use crate::attr::A_BOLD;
+
+        let plain = CCharT::from_chtype(ChType::from(b'a') | A_BOLD);
+        assert_eq!((plain.spacing_char(), plain.attrs()), ('a', A_BOLD));
+        let latin1 = CCharT::from_chtype(0xE9);
+        assert_eq!((latin1.spacing_char(), latin1.attrs()), ('é', A_NORMAL));
+
+        // A line-drawing code becomes the character, without A_ALTCHARSET.
+        let line = CCharT::from_chtype(acs_char(ACS_HLINE) | A_BOLD);
+        assert_eq!((line.spacing_char(), line.attrs()), (ACS_HLINE, A_BOLD));
+
+        // Without A_ALTCHARSET the same byte is an ordinary letter.
+        assert_eq!(CCharT::from_chtype(ChType::from(b'q')).spacing_char(), 'q');
+
+        // A byte that is not a line-drawing code keeps A_ALTCHARSET.
+        let other = CCharT::from_chtype(ChType::from(b'A') | A_ALTCHARSET);
+        assert_eq!((other.spacing_char(), other.attrs()), ('A', A_ALTCHARSET));
+    }
+
+    #[test]
+    fn test_cchar_to_chtype() {
+        use crate::acs::{ACS_DEGREE, ACS_HLINE, acs_char};
+        use crate::attr::A_BOLD;
+
+        assert_eq!(
+            CCharT::from_char_attr('a', A_BOLD).to_chtype(),
+            ChType::from(b'a') | A_BOLD
+        );
+        assert_eq!(
+            CCharT::from_char_attr(ACS_HLINE, A_BOLD).to_chtype(),
+            acs_char(ACS_HLINE) | A_BOLD
+        );
+        // A character that fits in a ChType is returned as itself, even
+        // when it is also an ACS character.
+        assert_eq!(CCharT::from_char(ACS_DEGREE).to_chtype(), 0xB0);
+        assert_eq!(CCharT::from_char('é').to_chtype(), 0xE9);
+
+        // Every ChType made by `acs_char` survives the round trip, give or
+        // take the characters that fit in a ChType directly.
+        for code in 0..=u8::MAX {
+            let Some(c) = crate::acs::acs_unicode(code) else {
+                continue;
+            };
+            let back = CCharT::from_chtype(acs_char(c)).to_chtype();
+            assert_eq!(CCharT::from_chtype(back).spacing_char(), c, "{c}");
+        }
+    }
 
     #[test]
     fn test_cchar_creation() {

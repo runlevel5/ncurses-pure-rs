@@ -3,7 +3,9 @@
 //! This module implements the WINDOW structure and all window-related
 //! operations as defined by the X/Open XSI Curses standard.
 
-use crate::attr::{self, A_CHARTEXT, A_NORMAL, color_pair};
+#[cfg(not(feature = "wide"))]
+use crate::attr::A_CHARTEXT;
+use crate::attr::{self, A_NORMAL, color_pair};
 use crate::error::{Error, Result};
 use crate::line::LineData;
 use crate::types::{AttrT, ChType, NcursesSize, WindowFlags};
@@ -770,11 +772,7 @@ impl Window {
     /// Add a character at the current cursor position (wide character version).
     #[cfg(feature = "wide")]
     pub fn addch(&mut self, ch: ChType) -> Result<()> {
-        // Convert ChType to CCharT
-        let c = (ch & A_CHARTEXT) as u8 as char;
-        let attr = (ch & !A_CHARTEXT) | self.attrs;
-        let cchar = CCharT::from_char_attr(c, attr);
-        self.add_wch_internal(cchar)
+        self.add_wch_internal(CCharT::from_chtype(ch | self.attrs))
     }
 
     /// Add a wide character at the current position.
@@ -1004,11 +1002,7 @@ impl Window {
             #[cfg(not(feature = "wide"))]
             self.lines[y].set(x, ch | self.attrs);
             #[cfg(feature = "wide")]
-            {
-                let c = (ch & A_CHARTEXT) as u8 as char;
-                let attr = (ch & !A_CHARTEXT) | self.attrs;
-                self.lines[y].set(x, CCharT::from_char_attr(c, attr));
-            }
+            self.lines[y].set(x, CCharT::from_chtype(ch | self.attrs));
         }
 
         Ok(())
@@ -1144,9 +1138,7 @@ impl Window {
         let y = self.cury as usize;
         let x = self.curx as usize;
         if y <= self.maxy as usize && x <= self.maxx as usize {
-            let cchar = self.lines[y].get(x);
-            let c = cchar.spacing_char() as u8 as ChType;
-            c | cchar.attrs()
+            self.lines[y].get(x).to_chtype()
         } else {
             0
         }
@@ -1224,9 +1216,7 @@ impl Window {
             }
             #[cfg(feature = "wide")]
             {
-                let cchar = self.lines[y].get(x);
-                let c = cchar.spacing_char() as u8 as ChType;
-                *ch = c | cchar.attrs();
+                *ch = self.lines[y].get(x).to_chtype();
             }
             count += 1;
         }
@@ -1455,9 +1445,7 @@ impl Window {
     /// Set the background character and attribute (wide character version).
     #[cfg(feature = "wide")]
     pub fn bkgdset(&mut self, ch: ChType) {
-        let c = (ch & A_CHARTEXT) as u8 as char;
-        let attr = ch & !A_CHARTEXT;
-        self.bkgrnd = CCharT::from_char_attr(c, attr);
+        self.bkgrnd = CCharT::from_chtype(ch);
     }
 
     /// Get the background character.
@@ -1471,8 +1459,7 @@ impl Window {
     #[cfg(feature = "wide")]
     #[must_use]
     pub fn getbkgd(&self) -> ChType {
-        let c = self.bkgrnd.spacing_char() as u8 as ChType;
-        c | self.bkgrnd.attrs()
+        self.bkgrnd.to_chtype()
     }
 
     /// Set the background and apply to entire window.
@@ -1512,9 +1499,7 @@ impl Window {
     /// Set the background and apply to entire window (wide character version).
     #[cfg(feature = "wide")]
     pub fn bkgd(&mut self, ch: ChType) -> Result<()> {
-        let c = (ch & A_CHARTEXT) as u8 as char;
-        let attr = ch & !A_CHARTEXT;
-        self.bkgrnd = CCharT::from_char_attr(c, attr);
+        self.bkgrnd = CCharT::from_chtype(ch);
         // For simplicity, just set background without full update
         Ok(())
     }
@@ -1714,7 +1699,7 @@ impl Window {
         if ch == 0 {
             *default
         } else {
-            CCharT::from_char_attr((ch & A_CHARTEXT) as u8 as char, ch & !A_CHARTEXT)
+            CCharT::from_chtype(ch)
         }
     }
 
@@ -1862,11 +1847,7 @@ impl Window {
         #[cfg(not(feature = "wide"))]
         self.lines[y].insert(x, ch | self.attrs, 1);
         #[cfg(feature = "wide")]
-        {
-            let c = (ch & A_CHARTEXT) as u8 as char;
-            let attr = (ch & !A_CHARTEXT) | self.attrs;
-            self.lines[y].insert(x, CCharT::from_char_attr(c, attr), 1);
-        }
+        self.lines[y].insert(x, CCharT::from_chtype(ch | self.attrs), 1);
 
         Ok(())
     }
@@ -2674,10 +2655,15 @@ mod tests {
 
     /// The text of every line of a three-column window.
     fn rows(win: &mut Window) -> Vec<String> {
+        rows_of(win, 3)
+    }
+
+    /// The first `width` columns of every line of a window.
+    fn rows_of(win: &mut Window, width: i32) -> Vec<String> {
         (0..win.getmaxy())
             .map(|y| {
                 win.mv(y, 0).unwrap();
-                win.instr(3)
+                win.instr(width)
             })
             .collect()
     }
@@ -2756,6 +2742,119 @@ mod tests {
         win.hline(0, 1).unwrap();
         let cell = win.lines[0].get(0);
         assert_eq!((cell.spacing_char(), cell.attr), ('─', A_BOLD));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_characters_can_be_drawn_through_a_chtype() {
+        use crate::acs::*;
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.addch(acs_char(ACS_ULCORNER)).unwrap();
+        win.addch(acs_char(ACS_HLINE)).unwrap();
+        win.addch(acs_char(ACS_URCORNER)).unwrap();
+        win.mv(1, 0).unwrap();
+        win.insch(acs_char(ACS_VLINE)).unwrap();
+        win.mv(2, 0).unwrap();
+        win.addchstr(&[
+            acs_char(ACS_LLCORNER),
+            acs_char(ACS_DIAMOND),
+            acs_char(ACS_PI),
+        ])
+        .unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│  ", "└◆π"]);
+
+        // The cell holds the character itself, without A_ALTCHARSET.
+        let cell = win.lines[0].get(1);
+        assert_eq!((cell.spacing_char(), cell.attr), ('─', A_NORMAL));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_characters_keep_their_other_attributes() {
+        use crate::acs::*;
+
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addch(acs_char(ACS_HLINE) | A_BOLD).unwrap();
+        win.attron(A_UNDERLINE).unwrap();
+        win.addch(acs_char(ACS_VLINE)).unwrap();
+        let cells = [win.lines[0].get(0), win.lines[0].get(1)];
+        assert_eq!((cells[0].spacing_char(), cells[0].attr), ('─', A_BOLD));
+        assert_eq!((cells[1].spacing_char(), cells[1].attr), ('│', A_UNDERLINE));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_altcharset_attribute_turns_codes_into_line_drawing() {
+        use crate::attr::A_ALTCHARSET;
+
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.attron(A_ALTCHARSET).unwrap();
+        win.addch('l' as ChType).unwrap();
+        win.addch('q' as ChType).unwrap();
+        // A character that is not a line-drawing code stays as it is.
+        win.addch('A' as ChType).unwrap();
+        assert_eq!(rows(&mut win), ["┌─A"]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_characters_in_borders_and_lines() {
+        use crate::acs::*;
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.box_(acs_char(ACS_VLINE), acs_char(ACS_HLINE)).unwrap();
+        assert_eq!(rows(&mut win), ["┌─┐", "│ │", "└─┘"]);
+
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        let (tee, plus) = (acs_char(ACS_TTEE), acs_char(ACS_PLUS));
+        win.border(0, 0, 0, 0, tee, tee, plus, plus).unwrap();
+        assert_eq!(rows(&mut win), ["┬─┬", "│ │", "┼─┼"]);
+
+        let mut win = Window::new(2, 3, 0, 0).unwrap();
+        win.hline(acs_char(ACS_S9), 3).unwrap();
+        win.mv(0, 1).unwrap();
+        win.vline(acs_char(ACS_CKBOARD), 2).unwrap();
+        assert_eq!(rows(&mut win), ["⎽▒⎽", " ▒ "]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_characters_read_back_as_the_chtype_that_drew_them() {
+        use crate::acs::*;
+
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        let drawn = [
+            acs_char(ACS_HLINE) | A_BOLD,
+            acs_char(ACS_LARROW),
+            'x' as ChType | A_UNDERLINE,
+            0xE9, // é fits in a ChType as it is
+        ];
+        win.addchstr(&drawn).unwrap();
+
+        let mut read = [0; 4];
+        assert_eq!(win.inchnstr(&mut read, 4), 4);
+        assert_eq!(read, drawn);
+        win.mv(0, 1).unwrap();
+        assert_eq!(win.inch(), acs_char(ACS_LARROW));
+
+        // Drawing what was read gives the same characters again.
+        let mut copy = Window::new(1, 4, 0, 0).unwrap();
+        copy.addchstr(&read).unwrap();
+        assert_eq!(rows_of(&mut copy, 4), rows_of(&mut win, 4));
+        assert_eq!(rows_of(&mut copy, 4), ["─←xé"]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_acs_background_character() {
+        use crate::acs::*;
+
+        let mut win = Window::new(1, 2, 0, 0).unwrap();
+        win.bkgdset(acs_char(ACS_BOARD));
+        assert_eq!(win.getbkgd(), acs_char(ACS_BOARD));
+        win.erase().unwrap();
+        assert_eq!(rows_of(&mut win, 2), ["▓▓"]);
     }
 
     #[test]
