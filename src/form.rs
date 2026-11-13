@@ -4,7 +4,9 @@
 //! with fields. This feature must be enabled with the `form` feature flag.
 
 use crate::error::{Error, Result};
-use crate::types::{AttrT, ChType};
+use crate::types::AttrT;
+#[cfg(not(feature = "wide"))]
+use crate::types::ChType;
 use crate::window::Window;
 
 use std::cell::RefCell;
@@ -358,11 +360,17 @@ pub struct Field {
 
 impl Field {
     /// Create a new field.
+    ///
+    /// A field is at least one row high and one column wide, and its
+    /// position and extra rows and buffers cannot be negative: arguments
+    /// outside those limits are brought inside them.
     pub fn new(height: i32, width: i32, row: i32, col: i32, offscreen: i32, nbuffers: i32) -> Self {
-        // Initialize buffer with appropriate number of lines
-        let total_rows = (height + offscreen) as usize;
-        let mut buffer = Vec::with_capacity(total_rows.max(1));
-        buffer.push(String::new());
+        let (height, width) = (height.max(1), width.max(1));
+        let (row, col) = (row.max(0), col.max(0));
+        let (offscreen, nbuffers) = (offscreen.max(0), nbuffers.max(0));
+
+        // The buffer grows as lines are added
+        let buffer = vec![String::new()];
 
         Self {
             row,
@@ -582,11 +590,19 @@ impl Field {
             self.scroll_row = self.cursor_row - visible_rows + 1;
         }
 
-        // Horizontal scrolling
+        // Horizontal scrolling: the cursor has to start inside the visible
+        // columns, which double-width characters use up twice as fast.
         if self.cursor_col < self.scroll_col {
             self.scroll_col = self.cursor_col;
-        } else if self.cursor_col >= self.scroll_col + visible_cols {
-            self.scroll_col = self.cursor_col - visible_cols + 1;
+        } else {
+            let line = self.current_line();
+            let mut scroll_col = self.scroll_col;
+            while scroll_col < self.cursor_col
+                && Self::cols_between(line, scroll_col, self.cursor_col) >= visible_cols
+            {
+                scroll_col += 1;
+            }
+            self.scroll_col = scroll_col;
         }
     }
 
@@ -610,6 +626,41 @@ impl Field {
         line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
     }
 
+    /// The screen columns a character takes: two for a double-width one.
+    fn char_cols(c: char) -> usize {
+        unicode_width::UnicodeWidthChar::width(c)
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// The screen columns `line` takes.
+    fn cols(line: &str) -> usize {
+        line.chars().map(Self::char_cols).sum()
+    }
+
+    /// The screen columns taken by the characters of `line` from index
+    /// `from` up to, not including, index `to`.
+    fn cols_between(line: &str, from: usize, to: usize) -> usize {
+        line.chars()
+            .skip(from)
+            .take(to.saturating_sub(from))
+            .map(Self::char_cols)
+            .sum()
+    }
+
+    /// The byte offset in `line` of the first character that does not fit
+    /// in `cols` screen columns, or the length of `line` when all of it fits.
+    fn byte_offset_of_cols(line: &str, cols: usize) -> usize {
+        let mut used = 0;
+        for (offset, c) in line.char_indices() {
+            used += Self::char_cols(c);
+            if used > cols {
+                return offset;
+            }
+        }
+        line.len()
+    }
+
     /// Insert a character at the cursor position.
     pub fn insert_char(&mut self, ch: char) {
         // Ensure we have enough rows
@@ -621,15 +672,16 @@ impl Field {
         if self.opts.contains(FieldOpts::O_STATIC) {
             // For single-line fields, check width
             if self.height == 1
-                && Self::char_len(&self.buffer[self.cursor_row]) >= self.width as usize
+                && Self::cols(&self.buffer[self.cursor_row]) + Self::char_cols(ch)
+                    > self.width as usize
             {
                 return;
             }
             // For multi-line fields, check total capacity
             if self.height > 1 {
-                let total_chars: usize = self.buffer.iter().map(|s| Self::char_len(s)).sum();
-                let max_chars = (self.height + self.offscreen) as usize * self.width as usize;
-                if total_chars >= max_chars {
+                let total_cols: usize = self.buffer.iter().map(|s| Self::cols(s)).sum();
+                let max_cols = (self.height + self.offscreen) as usize * self.width as usize;
+                if total_cols + Self::char_cols(ch) > max_cols {
                     return;
                 }
             }
@@ -644,50 +696,56 @@ impl Field {
 
         // Handle wrap for multi-line fields
         if self.opts.contains(FieldOpts::O_WRAP) && self.height > 1 {
-            self.wrap_line_if_needed();
+            self.wrap_line(self.cursor_row);
         }
 
         self.adjust_scroll();
     }
 
-    /// Wrap the current line if it exceeds the field width.
-    fn wrap_line_if_needed(&mut self) {
+    /// Wrap line `row` if it is longer than the field is wide.
+    ///
+    /// What does not fit moves to the start of the next line, which is
+    /// wrapped in turn. The line breaks after its last space, or at the
+    /// field's width when it has none. The cursor stays with the text it was
+    /// in.
+    fn wrap_line(&mut self, row: usize) {
         let width = self.width as usize;
-        if Self::char_len(&self.buffer[self.cursor_row]) > width {
-            // Find the last space before the width limit, or just break at width
-            let line = &self.buffer[self.cursor_row];
-            let limit = Self::byte_offset(line, width);
-            let break_pos = line[..limit]
-                .rfind(' ')
-                .map(|p| p + 1) // Break after the space
-                .unwrap_or(limit);
-            // The column the break falls on
-            let break_col = Self::char_len(&line[..break_pos]);
-
-            let rest = self.buffer[self.cursor_row].split_off(break_pos);
-
-            // Move cursor to next line if it was past the break
-            if self.cursor_col >= break_col {
-                // Insert a new line or append to next
-                if self.cursor_row + 1 < self.buffer.len() {
-                    let next_line = &mut self.buffer[self.cursor_row + 1];
-                    let old_len = rest.len();
-                    *next_line = rest + next_line;
-                    self.cursor_row += 1;
-                    self.cursor_col -= break_col;
-                    // If we just added content to an existing line, it might need wrapping too
-                    if Self::char_len(next_line) > width {
-                        self.wrap_line_if_needed();
-                    }
-                    // Adjust cursor position
-                    let _ = old_len; // The position should be relative to what we moved
-                } else {
-                    self.buffer.push(rest);
-                    self.cursor_row += 1;
-                    self.cursor_col -= break_col;
-                }
-            }
+        if width == 0 || Self::cols(&self.buffer[row]) <= width {
+            return;
         }
+
+        // Find the last space before the width limit, or just break at width
+        let line = &self.buffer[row];
+        let limit = match Self::byte_offset_of_cols(line, width) {
+            // Not even the first character fits: it gets a line to itself
+            0 => line.chars().next().map_or(0, char::len_utf8),
+            limit => limit,
+        };
+        if limit == line.len() {
+            return;
+        }
+        let break_pos = line[..limit]
+            .rfind(' ')
+            .map(|p| p + 1) // Break after the space
+            .unwrap_or(limit);
+        // The column the break falls on
+        let break_col = Self::char_len(&line[..break_pos]);
+
+        let rest = self.buffer[row].split_off(break_pos);
+        if row + 1 < self.buffer.len() {
+            self.buffer[row + 1].insert_str(0, &rest);
+        } else {
+            self.buffer.push(rest);
+        }
+
+        if self.cursor_row == row && self.cursor_col >= break_col {
+            // The cursor was in the part that moved
+            self.cursor_row += 1;
+            self.cursor_col -= break_col;
+        }
+
+        // The next line may now be too long as well
+        self.wrap_line(row + 1);
     }
 
     /// Delete the character before the cursor.
@@ -977,14 +1035,12 @@ impl Field {
     /// top-left corner. A cursor that is scrolled out of view is reported at
     /// the nearest edge.
     fn cursor_in_window(&self) -> (i32, i32) {
-        let offset = |cursor: usize, scroll: usize, size: i32| {
-            let offset = cursor as i64 - scroll as i64;
-            offset.clamp(0, i64::from(size.max(1)) - 1) as i32
-        };
-        (
-            offset(self.cursor_row, self.scroll_row, self.height),
-            offset(self.cursor_col, self.scroll_col, self.width),
-        )
+        let clamp = |offset: i64, size: i32| offset.clamp(0, i64::from(size.max(1)) - 1) as i32;
+        // Rows count lines; columns count what the characters between the
+        // left edge and the cursor take on screen.
+        let row = self.cursor_row as i64 - self.scroll_row as i64;
+        let col = Self::cols_between(self.current_line(), self.scroll_col, self.cursor_col);
+        (clamp(row, self.height), clamp(col as i64, self.width))
     }
 
     /// Scroll field forward by n lines.
@@ -1035,13 +1091,25 @@ impl Field {
     ///
     /// The cursor moves with the text as far as its line reaches.
     pub fn scroll_hforward(&mut self, n: usize) {
-        let max_col = self
+        // The furthest any line needs scrolling for its end to be in view
+        let width = self.width as usize;
+        let max_scroll = self
             .buffer
             .iter()
-            .map(|s| Self::char_len(s))
+            .map(|line| {
+                let mut tail_cols = 0;
+                let fits = line
+                    .chars()
+                    .rev()
+                    .take_while(|c| {
+                        tail_cols += Self::char_cols(*c);
+                        tail_cols <= width
+                    })
+                    .count();
+                Self::char_len(line) - fits
+            })
             .max()
             .unwrap_or(0);
-        let max_scroll = max_col.saturating_sub(self.width as usize);
         let scroll_col = self.scroll_col.saturating_add(n).min(max_scroll);
         let moved = scroll_col.saturating_sub(self.scroll_col);
         self.scroll_col = scroll_col;
@@ -1078,29 +1146,30 @@ impl Field {
                 .map(|s| s.as_str())
                 .unwrap_or("");
 
-            // Pre-collect characters for efficient indexed access
-            let chars: Vec<char> = content.chars().collect();
-            let visible_start = self.scroll_col;
-
-            // Write characters with attribute
-            for col in 0..self.width as usize {
-                let content_col = visible_start + col;
-                let ch = if content_col < chars.len() {
-                    chars[content_col]
-                } else {
-                    self.pad
-                };
-
+            // The characters that fit in the field's columns, then padding.
+            // A double-width character takes two columns, and is left out
+            // when only one is free.
+            let width = self.width as usize;
+            let mut used = 0;
+            let visible = content
+                .chars()
+                .skip(self.scroll_col)
                 // Don't display if O_PUBLIC is not set (password field)
-                let display_ch = if is_public {
-                    ch
-                } else if ch != self.pad {
-                    '*' // Mask non-pad characters
-                } else {
-                    self.pad
-                };
+                .map(|ch| if is_public || ch == self.pad { ch } else { '*' })
+                .take_while(|ch| {
+                    used += Self::char_cols(*ch);
+                    used <= width
+                })
+                .collect::<Vec<_>>();
+            let shown: usize = visible.iter().map(|ch| Self::char_cols(*ch)).sum();
+            let padding = std::iter::repeat_n(self.pad, width.saturating_sub(shown));
 
+            for display_ch in visible.into_iter().chain(padding) {
                 if is_visible {
+                    // A character outside Latin-1 does not fit in a ChType
+                    #[cfg(feature = "wide")]
+                    win.add_wch(&crate::wide::CCharT::from_char_attr(display_ch, attr))?;
+                    #[cfg(not(feature = "wide"))]
                     win.addch(display_ch as ChType | attr)?;
                 }
             }
@@ -1181,7 +1250,7 @@ impl Form {
             .map(|f| Rc::new(RefCell::new(f)))
             .collect();
 
-        Self {
+        let mut form = Self {
             fields,
             current: 0,
             opts: FormOpts::empty(),
@@ -1196,7 +1265,68 @@ impl Form {
             form_term: None,
             field_init: None,
             field_term: None,
+        };
+        // Start on the first field that can take the cursor
+        form.current = form.find_selectable(0, true).unwrap_or(0);
+        form
+    }
+
+    /// Whether field `index` can be the current field: it has to be
+    /// visible and active.
+    fn is_selectable(&self, index: usize) -> bool {
+        self.fields.get(index).is_some_and(|field| {
+            field
+                .borrow()
+                .opts()
+                .contains(FieldOpts::O_VISIBLE | FieldOpts::O_ACTIVE)
+        })
+    }
+
+    /// The first field that can be the current field, looking from `start`
+    /// onwards (or backwards) and wrapping round the form.
+    fn find_selectable(&self, start: usize, forward: bool) -> Option<usize> {
+        let count = self.fields.len();
+        (0..count)
+            .map(|step| {
+                if forward {
+                    (start + step) % count
+                } else {
+                    (start + count - step) % count
+                }
+            })
+            .find(|index| self.is_selectable(*index))
+    }
+
+    /// Make the field found by [`find_selectable`](Self::find_selectable)
+    /// the current one. `offset` is where to start looking, counted from
+    /// the current field when `from_current` is set and from the first
+    /// field otherwise.
+    fn select_field(&mut self, from_current: bool, offset: usize, forward: bool) {
+        let count = self.fields.len();
+        if count == 0 {
+            return;
         }
+        let base = if from_current { self.current } else { 0 };
+        if let Some(index) = self.find_selectable((base + offset) % count, forward) {
+            self.current = index;
+        }
+    }
+
+    /// Whether `req` changes the contents of the current field.
+    fn is_edit_request(req: i32) -> bool {
+        matches!(
+            req,
+            REQ_INS_CHAR
+                | REQ_DEL_CHAR
+                | REQ_DEL_PREV
+                | REQ_NEW_LINE
+                | REQ_INS_LINE
+                | REQ_DEL_LINE
+                | REQ_DEL_WORD
+                | REQ_CLR_EOL
+                | REQ_CLR_EOF
+                | REQ_CLR_FIELD
+        ) || (0x20..0x7f).contains(&req)
     }
 
     /// Get the number of fields.
@@ -1346,6 +1476,21 @@ impl Form {
 
     /// Process a form request.
     pub fn driver(&mut self, req: i32) -> Result<()> {
+        // A field without O_EDIT can be looked at and moved around in, but
+        // not changed.
+        if Self::is_edit_request(req)
+            && let Some(field) = self.fields.get(self.current)
+            && !field.borrow().opts().contains(FieldOpts::O_EDIT)
+        {
+            return Err(Error::InvalidArgument(
+                "the current field cannot be edited".into(),
+            ));
+        }
+
+        // Fields that are hidden or not active are skipped when moving
+        // between fields.
+        let last = self.fields.len().saturating_sub(1);
+
         match req {
             // Page navigation
             REQ_NEXT_PAGE => {
@@ -1366,48 +1511,11 @@ impl Form {
             }
 
             // Field navigation
-            REQ_NEXT_FIELD => {
-                if self.current + 1 < self.fields.len() {
-                    self.current += 1;
-                } else {
-                    self.current = 0;
-                }
-            }
-            REQ_PREV_FIELD => {
-                if self.current > 0 {
-                    self.current -= 1;
-                } else {
-                    self.current = self.fields.len().saturating_sub(1);
-                }
-            }
-            REQ_FIRST_FIELD => {
-                self.current = 0;
-            }
-            REQ_LAST_FIELD => {
-                self.current = self.fields.len().saturating_sub(1);
-            }
-            REQ_SNEXT_FIELD => {
-                // Sorted next - for now same as next
-                if self.current + 1 < self.fields.len() {
-                    self.current += 1;
-                } else {
-                    self.current = 0;
-                }
-            }
-            REQ_SPREV_FIELD => {
-                // Sorted prev - for now same as prev
-                if self.current > 0 {
-                    self.current -= 1;
-                } else {
-                    self.current = self.fields.len().saturating_sub(1);
-                }
-            }
-            REQ_SFIRST_FIELD => {
-                self.current = 0;
-            }
-            REQ_SLAST_FIELD => {
-                self.current = self.fields.len().saturating_sub(1);
-            }
+            // The sorted requests are the same as the plain ones for now
+            REQ_NEXT_FIELD | REQ_SNEXT_FIELD => self.select_field(true, 1, true),
+            REQ_PREV_FIELD | REQ_SPREV_FIELD => self.select_field(true, last, false),
+            REQ_FIRST_FIELD | REQ_SFIRST_FIELD => self.select_field(false, 0, true),
+            REQ_LAST_FIELD | REQ_SLAST_FIELD => self.select_field(false, last, false),
             REQ_LEFT_FIELD | REQ_UP_FIELD => {
                 // Spatial navigation - move to field above/left
                 self.navigate_to_adjacent_field(-1, 0);
@@ -1662,7 +1770,7 @@ impl Form {
         let mut best_distance = i32::MAX;
 
         for (idx, field) in self.fields.iter().enumerate() {
-            if idx == self.current {
+            if idx == self.current || !self.is_selectable(idx) {
                 continue;
             }
             let f = field.borrow();
@@ -2776,6 +2884,333 @@ mod tests {
         let mut win = Window::new(5, 20, 0, 0).unwrap();
         form.render_to(&mut win).unwrap();
         assert_eq!(field.borrow().cursor_row(), 1);
+    }
+
+    #[test]
+    fn test_field_wrap_keeps_the_text_pushed_off_the_line() {
+        // Inserting at the start of a full line pushes its last character
+        // onto the next line.
+        let mut field = Field::new(2, 5, 0, 0, 0, 0);
+        field.set_buffer("abcde");
+        field.insert_char('x');
+        assert_eq!(field.buffer(), "xabcd\ne");
+        assert_eq!(field.cursor_pos(), (0, 1));
+
+        // Typing at the end still takes the cursor to the next line.
+        let mut field = Field::new(2, 5, 0, 0, 0, 0);
+        field.set_buffer("abcde");
+        field.cursor_line_end();
+        field.insert_char('x');
+        assert_eq!(field.buffer(), "abcde\nx");
+        assert_eq!(field.cursor_pos(), (1, 1));
+    }
+
+    #[test]
+    fn test_field_wrap_carries_on_through_the_following_lines() {
+        let mut field = Field::new(4, 3, 0, 0, 0, 0);
+        field.set_buffer("abc\ndef\ng");
+        field.insert_char('x');
+        assert_eq!(field.buffer(), "xab\ncde\nfg");
+        assert_eq!(field.cursor_pos(), (0, 1));
+
+        // In the middle of a line.
+        let mut field = Field::new(4, 3, 0, 0, 0, 0);
+        field.set_buffer("abc\ndef");
+        field.cursor_right();
+        field.cursor_right();
+        field.insert_char('x');
+        assert_eq!(field.buffer(), "abx\ncde\nf");
+        assert_eq!(field.cursor_pos(), (1, 0));
+    }
+
+    #[test]
+    fn test_field_wrap_at_a_space_keeps_the_rest_of_the_line() {
+        let mut field = Field::new(2, 6, 0, 0, 0, 0);
+        field.set_buffer("ab cd");
+        field.insert_char('x');
+        field.insert_char('y');
+        assert_eq!(field.buffer(), "xyab \ncd");
+        assert_eq!(field.cursor_pos(), (0, 2));
+    }
+
+    /// A field with `off` removed from its default options.
+    fn field_without(row: i32, off: FieldOpts) -> Field {
+        let mut field = Field::new(1, 10, row, 0, 0, 0);
+        field.set_opts(field.opts() & !off);
+        field
+    }
+
+    #[test]
+    fn test_form_navigation_skips_fields_that_cannot_take_the_cursor() {
+        let mut form = Form::new(vec![
+            field_without(0, FieldOpts::O_ACTIVE | FieldOpts::O_EDIT), // a label
+            field_without(1, FieldOpts::empty()),
+            field_without(2, FieldOpts::O_VISIBLE),
+            field_without(3, FieldOpts::empty()),
+        ]);
+        // The form starts on the first field that can take the cursor.
+        assert_eq!(form.current_field_index(), 1);
+
+        for (request, expected) in [
+            (REQ_NEXT_FIELD, 3),
+            (REQ_NEXT_FIELD, 1),
+            (REQ_PREV_FIELD, 3),
+            (REQ_PREV_FIELD, 1),
+            (REQ_LAST_FIELD, 3),
+            (REQ_FIRST_FIELD, 1),
+            (REQ_SNEXT_FIELD, 3),
+            (REQ_SFIRST_FIELD, 1),
+            (REQ_SLAST_FIELD, 3),
+            (REQ_SPREV_FIELD, 1),
+            (REQ_DOWN_FIELD, 3),
+            (REQ_UP_FIELD, 1),
+            // Nothing to go to above the first or below the last.
+            (REQ_UP_FIELD, 1),
+        ] {
+            form.driver(request).unwrap();
+            assert_eq!(form.current_field_index(), expected, "request {request:#x}");
+        }
+    }
+
+    #[test]
+    fn test_form_navigation_with_no_field_to_go_to() {
+        let mut form = Form::new(vec![
+            field_without(0, FieldOpts::O_ACTIVE),
+            field_without(1, FieldOpts::O_ACTIVE),
+        ]);
+        assert_eq!(form.current_field_index(), 0);
+        for request in [
+            REQ_NEXT_FIELD,
+            REQ_PREV_FIELD,
+            REQ_LAST_FIELD,
+            REQ_DOWN_FIELD,
+        ] {
+            form.driver(request).unwrap();
+            assert_eq!(form.current_field_index(), 0);
+        }
+
+        // A single field goes to itself, and an empty form does nothing.
+        let mut form = Form::new(vec![field_without(0, FieldOpts::empty())]);
+        form.driver(REQ_NEXT_FIELD).unwrap();
+        form.driver(REQ_PREV_FIELD).unwrap();
+        assert_eq!(form.current_field_index(), 0);
+        let mut form = Form::new(vec![]);
+        form.driver(REQ_NEXT_FIELD).unwrap();
+        form.driver(REQ_LAST_FIELD).unwrap();
+    }
+
+    #[test]
+    fn test_form_refuses_to_edit_a_field_without_o_edit() {
+        let mut field = field_without(0, FieldOpts::O_EDIT);
+        field.set_buffer("Name:");
+        let mut form = Form::new(vec![field]);
+
+        for request in [
+            'Z' as i32,
+            REQ_CLR_FIELD,
+            REQ_CLR_EOL,
+            REQ_CLR_EOF,
+            REQ_DEL_CHAR,
+            REQ_DEL_PREV,
+            REQ_DEL_WORD,
+            REQ_DEL_LINE,
+            REQ_INS_CHAR,
+            REQ_INS_LINE,
+            REQ_NEW_LINE,
+        ] {
+            assert!(form.driver(request).is_err(), "request {request:#x}");
+            assert_eq!(form.data()[0], "Name:");
+        }
+
+        // Moving around in it is still allowed.
+        form.driver(REQ_END_LINE).unwrap();
+        assert_eq!(form.current_field().unwrap().borrow().cursor_col(), 5);
+        form.driver(REQ_NEXT_FIELD).unwrap();
+        form.driver(REQ_VALIDATION).unwrap();
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_field_renders_characters_outside_latin_1() {
+        use crate::attr::A_BOLD;
+
+        let mut field = Field::new(1, 4, 1, 2, 0, 0);
+        field.set_fore(A_BOLD);
+        field.set_buffer("日é");
+        let mut win = Window::new(3, 10, 0, 0).unwrap();
+        field.render(&mut win, true).unwrap();
+
+        win.mv(1, 2).unwrap();
+        let wide = win.in_wch();
+        assert_eq!((wide.spacing_char(), wide.attrs()), ('日', A_BOLD));
+        win.mv(1, 4).unwrap();
+        let latin = win.in_wch();
+        assert_eq!((latin.spacing_char(), latin.attrs()), ('é', A_BOLD));
+    }
+
+    #[test]
+    fn test_field_holds_as_many_double_width_characters_as_fit() {
+        // Four columns hold two double-width characters and nothing more.
+        let mut field = Field::new(1, 4, 0, 0, 0, 0);
+        for ch in "日本語a".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日本");
+
+        // Five hold two of them and one ordinary character.
+        let mut field = Field::new(1, 5, 0, 0, 0, 0);
+        for ch in "日本語a語b".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日本a");
+
+        // The same goes for a multi-line field's total.
+        let mut field = Field::new(2, 4, 0, 0, 0, 0);
+        for ch in "日本語学校a".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日本\n語学");
+    }
+
+    #[test]
+    fn test_field_wraps_double_width_characters_by_their_width() {
+        let mut field = Field::new(3, 4, 0, 0, 0, 0);
+        for ch in "日本語".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日本\n語");
+        assert_eq!(field.cursor_pos(), (1, 1));
+
+        // A character that needs both columns of what is left moves down
+        // whole.
+        let mut field = Field::new(3, 3, 0, 0, 0, 0);
+        for ch in "a日本".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "a日\n本");
+
+        // A field narrower than the character gives it a line to itself.
+        let mut field = Field::new(3, 1, 0, 0, 0, 0);
+        field.set_opts(field.opts() & !FieldOpts::O_STATIC);
+        for ch in "日本".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "日\n本");
+    }
+
+    #[test]
+    fn test_field_cursor_is_placed_by_the_width_of_the_text_before_it() {
+        let mut field = Field::new(1, 10, 1, 2, 0, 0);
+        field.set_buffer("日本x");
+        assert_eq!(field.cursor_in_window(), (0, 0));
+        field.cursor_right();
+        assert_eq!(field.cursor_in_window(), (0, 2));
+        field.cursor_right();
+        assert_eq!(field.cursor_in_window(), (0, 4));
+        field.cursor_right();
+        assert_eq!(field.cursor_in_window(), (0, 5));
+
+        let mut win = Window::new(3, 20, 0, 0).unwrap();
+        field.render(&mut win, true).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 7));
+    }
+
+    #[test]
+    fn test_field_scrolls_sideways_by_the_width_of_the_text() {
+        let mut field = Field::new(1, 4, 0, 0, 0, 0);
+        field.set_buffer("日本語学");
+
+        // The cursor at the end of the line has to be inside the field.
+        field.cursor_line_end();
+        assert_eq!(field.cursor_col(), 4);
+        assert_eq!(field.scroll_col(), 3);
+        assert_eq!(field.cursor_in_window(), (0, 2));
+        field.cursor_line_home();
+        assert_eq!(field.scroll_col(), 0);
+
+        // Scrolling stops when the end of the line is in view.
+        field.scroll_hforward(10);
+        assert_eq!(field.scroll_col(), 2);
+        field.scroll_hbackward(10);
+        assert_eq!(field.scroll_col(), 0);
+
+        // A mix: "a" and three double-width characters in five columns.
+        let mut field = Field::new(1, 5, 0, 0, 0, 0);
+        field.set_buffer("a日本語");
+        field.scroll_hforward(10);
+        assert_eq!(field.scroll_col(), 2);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_field_renders_double_width_characters_inside_its_columns() {
+        /// The spacing character of the first `n` cells of a line.
+        fn cells(win: &mut Window, y: i32, n: i32) -> Vec<char> {
+            (0..n)
+                .map(|x| {
+                    win.mv(y, x).unwrap();
+                    win.in_wch().spacing_char()
+                })
+                .collect()
+        }
+
+        // Exactly filled: nothing is written past the field.
+        let mut field = Field::new(1, 4, 0, 1, 0, 0);
+        field.set_buffer("日本語x");
+        let mut win = Window::new(2, 8, 0, 0).unwrap();
+        win.mvaddstr(0, 0, "<<<<<<<<").unwrap();
+        field.render(&mut win, false).unwrap();
+        assert_eq!(
+            cells(&mut win, 0, 8),
+            ['<', '日', '\0', '本', '\0', '<', '<', '<']
+        );
+
+        // One column left over: the next double-width character does not
+        // fit, and the column is padded.
+        let mut field = Field::new(1, 5, 0, 1, 0, 0);
+        field.set_pad('_');
+        field.set_buffer("日本語");
+        let mut win = Window::new(2, 8, 0, 0).unwrap();
+        win.mvaddstr(0, 0, "<<<<<<<<").unwrap();
+        field.render(&mut win, false).unwrap();
+        assert_eq!(
+            cells(&mut win, 0, 8),
+            ['<', '日', '\0', '本', '\0', '_', '<', '<']
+        );
+
+        // Scrolled sideways, and a password field shows one star each.
+        field.scroll_hforward(1);
+        field.render(&mut win, false).unwrap();
+        assert_eq!(
+            cells(&mut win, 0, 8),
+            ['<', '本', '\0', '語', '\0', '_', '<', '<']
+        );
+        field.set_opts(field.opts() & !FieldOpts::O_PUBLIC);
+        field.render(&mut win, false).unwrap();
+        assert_eq!(
+            cells(&mut win, 0, 8),
+            ['<', '*', '*', '_', '_', '_', '<', '<']
+        );
+    }
+
+    #[test]
+    fn test_field_dimensions_are_brought_within_limits() {
+        for (height, width) in [(-1, -5), (0, 0), (i32::MIN, i32::MIN)] {
+            let mut field = Field::new(height, width, -2, -3, -1, -1);
+            assert_eq!(field.dimensions(), (1, 1, 0, 0));
+            assert_eq!(field.offscreen(), 0);
+            assert_eq!(field.total_rows(), 1);
+
+            // It works as a field of one cell.
+            field.insert_char('a');
+            field.insert_char('b');
+            assert_eq!(field.buffer(), "a");
+            field.cursor_line_home();
+            let mut win = Window::new(2, 4, 0, 0).unwrap();
+            field.render(&mut win, true).unwrap();
+            win.mv(0, 0).unwrap();
+            assert_eq!(win.instr(2), "a ");
+        }
     }
 
     #[test]

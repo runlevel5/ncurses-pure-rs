@@ -168,6 +168,9 @@ impl Screen {
         screen.cbreak()?;
         screen.noecho()?;
 
+        // This is the program mode that `reset_prog_mode` comes back to
+        screen.terminal.save_prog_mode()?;
+
         // Clear the screen
         screen.terminal.clear_screen()?;
         screen.terminal.flush()?;
@@ -181,17 +184,10 @@ impl Screen {
     /// you can call `refresh()` to re-enter curses mode if needed.
     pub fn endwin(&mut self) -> Result<()> {
         if self.initialized {
-            // Disable mouse if enabled
+            // Stop mouse reports while curses mode is left. The protocol is
+            // remembered, so that coming back can switch them on again.
             #[cfg(feature = "mouse")]
-            if self.mouse_protocol != MouseProtocol::None {
-                let _ = self
-                    .terminal
-                    .write(self.mouse_protocol.disable_sequence().as_bytes());
-                let _ = self
-                    .terminal
-                    .write(MouseProtocol::ButtonEvent.disable_sequence().as_bytes());
-                self.mouse_protocol = MouseProtocol::None;
-            }
+            self.set_mouse_reporting(false);
 
             // Show cursor
             self.terminal.cursor_visible(true)?;
@@ -267,17 +263,21 @@ impl Screen {
     }
 
     /// Resize the terminal to the specified size.
+    ///
+    /// The standard screen keeps its contents, as far as they fit, and its
+    /// settings. The next refresh clears the terminal and repaints it.
     pub fn resize_term(&mut self, lines: i32, cols: i32) -> Result<()> {
+        // Resize the windows in place
+        self.stdscr.resize(lines, cols)?;
+        self.curscr.resize(lines, cols)?;
+        self.newscr.resize(lines, cols)?;
+
         // Update global dimensions
         globals::set_dimensions(lines, cols);
 
-        // Recreate windows with new size
-        self.stdscr = Window::new(lines, cols, 0, 0)?;
-        self.curscr = Window::new(lines, cols, 0, 0)?;
-        self.newscr = Window::new(lines, cols, 0, 0)?;
-
-        // Mark everything as needing update
-        self.stdscr.touchwin();
+        // What the terminal shows after a resize is anyone's guess: start
+        // again from a clear screen.
+        self.stdscr.clearok(true);
 
         Ok(())
     }
@@ -682,27 +682,34 @@ impl Screen {
         if newmask != 0 && self.mouse_protocol == MouseProtocol::None {
             // Enable SGR mouse protocol (most modern and feature-rich)
             self.mouse_protocol = MouseProtocol::Sgr;
-            let _ = self
-                .terminal
-                .write(MouseProtocol::Sgr.enable_sequence().as_bytes());
-            // Also enable button event tracking
-            let _ = self
-                .terminal
-                .write(MouseProtocol::ButtonEvent.enable_sequence().as_bytes());
+            self.set_mouse_reporting(true);
             let _ = self.terminal.flush();
         } else if newmask == 0 && self.mouse_protocol != MouseProtocol::None {
             // Disable mouse reporting
-            let _ = self
-                .terminal
-                .write(self.mouse_protocol.disable_sequence().as_bytes());
-            let _ = self
-                .terminal
-                .write(MouseProtocol::ButtonEvent.disable_sequence().as_bytes());
+            self.set_mouse_reporting(false);
             let _ = self.terminal.flush();
             self.mouse_protocol = MouseProtocol::None;
         }
 
         old
+    }
+
+    /// Tell the terminal to start or stop sending mouse reports in the
+    /// protocol in use, along with button event tracking. Does nothing when
+    /// the mouse is not in use.
+    #[cfg(feature = "mouse")]
+    fn set_mouse_reporting(&mut self, on: bool) {
+        if self.mouse_protocol == MouseProtocol::None {
+            return;
+        }
+        for protocol in [self.mouse_protocol, MouseProtocol::ButtonEvent] {
+            let sequence = if on {
+                protocol.enable_sequence()
+            } else {
+                protocol.disable_sequence()
+            };
+            let _ = self.terminal.write(sequence.as_bytes());
+        }
     }
 
     /// Get the next mouse event.
@@ -834,7 +841,27 @@ impl Screen {
                 }
             }
         }
+
+        // Everything changed is now on its way to the terminal.
+        self.stdscr.untouchwin();
+        let (leaveok, cury, curx) = (
+            self.stdscr.is_leaveok(),
+            self.stdscr.getcury(),
+            self.stdscr.getcurx(),
+        );
+        self.set_cursor_after_update(leaveok, cury, curx);
         Ok(())
+    }
+
+    /// Record where the next `doupdate` leaves the terminal's cursor: at
+    /// (`y`, `x`) on the screen, or wherever it ends up when `leaveok` is set
+    /// on the window that was refreshed last.
+    fn set_cursor_after_update(&mut self, leaveok: bool, y: i32, x: i32) {
+        self.newscr.leaveok(leaveok);
+        if !leaveok {
+            // A cursor outside the screen is left where it was.
+            let _ = self.newscr.mv(y, x);
+        }
     }
 
     /// Refresh a window (copy to physical screen).
@@ -846,7 +873,10 @@ impl Screen {
     }
 
     /// Copy a window to the virtual screen (but don't update physical screen).
-    pub fn wnoutrefresh(&mut self, win: &Window) -> Result<()> {
+    ///
+    /// The window's changes are then marked as dealt with, and the next
+    /// `doupdate` leaves the cursor at this window's cursor.
+    pub fn wnoutrefresh(&mut self, win: &mut Window) -> Result<()> {
         // Copy changed portions of win to newscr
         let begy = win.getbegy();
         let begx = win.getbegx();
@@ -876,11 +906,41 @@ impl Screen {
             }
         }
 
+        win.untouchwin();
+        self.set_cursor_after_update(win.is_leaveok(), begy + win.getcury(), begx + win.getcurx());
+
+        Ok(())
+    }
+
+    /// Come back from `endwin`: put the terminal in curses mode again, with
+    /// the input modes that were set, and have the screen repainted.
+    fn resume(&mut self) -> Result<()> {
+        self.terminal.enter_program_mode()?;
+        if self.input_mode.raw {
+            self.terminal.raw(true)?;
+        } else if self.input_mode.cbreak != 0 {
+            self.terminal.cbreak(true)?;
+        }
+        self.terminal.echo(self.input_mode.echo)?;
+        self.terminal
+            .cursor_visible(self.cursor_visibility != CursorVisibility::Invisible)?;
+        #[cfg(feature = "mouse")]
+        self.set_mouse_reporting(true);
+        self.initialized = true;
+
+        // The terminal shows the alternate screen afresh: repaint all of it.
+        self.stdscr.clearok(true);
         Ok(())
     }
 
     /// Update the physical screen from the virtual screen.
+    ///
+    /// After `endwin` this first puts the terminal back in curses mode.
     pub fn doupdate(&mut self) -> Result<()> {
+        if self.isendwin() {
+            self.resume()?;
+        }
+
         // Check if we need to clear the screen first
         let do_clear = self.stdscr.take_clear_flag();
         if do_clear {
@@ -986,14 +1046,14 @@ impl Screen {
                     last_attr = new_attr;
                 }
 
-                // Output the character
-                let c = cell.spacing_char();
-                if c == '\0' {
+                // Output the character, with its combining characters
+                if cell.is_null() {
                     self.terminal.write(b" ")?;
                 } else {
                     let mut buf = [0u8; 4];
-                    let s = c.encode_utf8(&mut buf);
-                    self.terminal.write(s.as_bytes())?;
+                    for c in cell.chars.iter().take_while(|c| **c != '\0') {
+                        self.terminal.write(c.encode_utf8(&mut buf).as_bytes())?;
+                    }
                 }
 
                 // A double-width character moves the cursor two columns.
@@ -1006,11 +1066,10 @@ impl Screen {
             self.terminal.set_attributes(A_NORMAL)?;
         }
 
-        // Position cursor at stdscr's cursor position
-        let cursor_y = self.stdscr.getcury();
-        let cursor_x = self.stdscr.getcurx();
-        if !self.stdscr.is_leaveok() {
-            self.terminal.move_cursor(cursor_y, cursor_x)?;
+        // Position the cursor at the cursor of the window refreshed last
+        if !self.newscr.is_leaveok() {
+            self.terminal
+                .move_cursor(self.newscr.getcury(), self.newscr.getcurx())?;
         }
 
         // Flush output
@@ -1029,9 +1088,6 @@ impl Screen {
             }
         }
 
-        // Clear touch flags on stdscr
-        self.stdscr.untouchwin();
-
         Ok(())
     }
 
@@ -1043,7 +1099,7 @@ impl Screen {
         // Handle color pair
         let pair = attr::pair_number(attr);
         if pair > 0 {
-            if let Ok((fg, bg)) = self.colors.pair_content(pair) {
+            if let Some((fg, bg)) = self.colors.pair_colors(i32::from(pair)) {
                 self.terminal.set_fg_color(fg)?;
                 self.terminal.set_bg_color(bg)?;
             }
@@ -1292,8 +1348,11 @@ impl Screen {
             if use_keypad && byte == 0x1b {
                 // Start escape sequence parsing
                 self.escape_parser.reset();
-                let result = self.parse_escape_sequence()?;
-                return Ok(result);
+                match self.parse_escape_sequence()? {
+                    Some(result) => return Ok(result),
+                    // A mouse event nobody asked for: keep waiting
+                    None => continue,
+                }
             }
 
             // Handle newline translation
@@ -1306,7 +1365,11 @@ impl Screen {
     }
 
     /// Parse an escape sequence after receiving ESC.
-    fn parse_escape_sequence(&mut self) -> Result<i32> {
+    ///
+    /// Returns the key it stands for, or ESC with the bytes after it handed
+    /// back to be read as ordinary input when it is not a known sequence.
+    /// Returns `None` for a mouse event that the mouse mask filters out.
+    fn parse_escape_sequence(&mut self) -> Result<Option<i32>> {
         self.escape_parser.reset();
         self.escape_parser.feed(0x1b);
 
@@ -1319,21 +1382,14 @@ impl Screen {
         loop {
             // Check timeout
             if start.elapsed() >= escape_timeout {
-                // Timeout - return the accumulated input
-                let input = self.escape_parser.current_input();
-                if input.len() == 1 {
-                    // Just ESC
-                    return Ok(0x1b);
+                // Timeout - return the current match if any, otherwise ESC
+                // with the bytes read after it handed back
+                if sequence_buf.len() > 1
+                    && let Some(key) = self.escape_parser.current_match()
+                {
+                    return Ok(Some(key));
                 }
-                // Return current match if any, otherwise just ESC
-                if let Some(key) = self.escape_parser.current_match() {
-                    return Ok(key);
-                }
-                // Push remaining bytes back to buffer (except ESC which we return)
-                for &b in &input[1..] {
-                    self.input_buffer.push(b as i32);
-                }
-                return Ok(0x1b);
+                return Ok(Some(self.give_back_escape_sequence(&sequence_buf)));
             }
 
             // Check for more input
@@ -1349,9 +1405,9 @@ impl Screen {
                 None => {
                     // EOF during escape - return what we have
                     if let Some(key) = self.escape_parser.current_match() {
-                        return Ok(key);
+                        return Ok(Some(key));
                     }
-                    return Ok(0x1b);
+                    return Ok(Some(self.give_back_escape_sequence(&sequence_buf)));
                 }
             };
 
@@ -1365,39 +1421,47 @@ impl Screen {
                     // Look for terminator
                     if byte == b'M' || byte == b'm' {
                         // Complete mouse sequence
-                        if let Some(event) = parse_sgr_mouse(&sequence_buf) {
-                            self.mouse.push_event(event);
-                            return Ok(KEY_MOUSE);
-                        }
+                        return Ok(match parse_sgr_mouse(&sequence_buf) {
+                            Some(event) if self.mouse.process_event(event) => Some(KEY_MOUSE),
+                            // Not an event the mouse mask asks for
+                            Some(_) => None,
+                            // Not a mouse report after all
+                            None => Some(self.give_back_escape_sequence(&sequence_buf)),
+                        });
                     }
                     // Continue accumulating if not complete
                     if sequence_buf.len() < 20 {
                         // Reasonable max length for mouse sequence
                         continue;
                     }
+                    return Ok(Some(self.give_back_escape_sequence(&sequence_buf)));
                 }
             }
 
             match self.escape_parser.feed(byte) {
                 EscapeMatch::Complete(key) => {
-                    return Ok(key);
+                    return Ok(Some(key));
                 }
                 EscapeMatch::None => {
-                    // No match - return ESC and push rest to buffer
-                    let input = self.escape_parser.current_input();
-                    if input.len() > 1 {
-                        for &b in &input[1..] {
-                            self.input_buffer.push(b as i32);
-                        }
-                    }
-                    self.input_buffer.push(byte as i32);
-                    return Ok(0x1b);
+                    // No match. The parser has already forgotten what it
+                    // was fed, so the bytes come from our own record.
+                    return Ok(Some(self.give_back_escape_sequence(&sequence_buf)));
                 }
                 EscapeMatch::Partial => {
                     // Continue reading
                 }
             }
         }
+    }
+
+    /// Give up on `sequence`, an ESC and the bytes read after it: queue
+    /// those bytes to be read as ordinary input, in order, and return the
+    /// ESC.
+    fn give_back_escape_sequence(&mut self, sequence: &[u8]) -> i32 {
+        for &byte in &sequence[1..] {
+            self.input_buffer.push(byte as i32);
+        }
+        0x1b
     }
 
     /// Push a character back into the input buffer.
@@ -4193,7 +4257,7 @@ impl Screen {
             // Screen to window
             let wy = *y - win.getbegy();
             let wx = *x - win.getbegx();
-            if wy >= 0 && wy <= win.getmaxy() && wx >= 0 && wx <= win.getmaxx() {
+            if wy >= 0 && wy < win.getmaxy() && wx >= 0 && wx < win.getmaxx() {
                 *y = wy;
                 *x = wx;
                 true
@@ -5443,6 +5507,8 @@ mod output_tests {
         /// The character in each cell; `'\0'` is the second cell of a
         /// double-width character.
         cells: Vec<Vec<char>>,
+        /// The combining characters drawn onto each cell.
+        combining: Vec<Vec<String>>,
         y: usize,
         x: usize,
     }
@@ -5451,6 +5517,7 @@ mod output_tests {
         fn new(lines: usize, cols: usize) -> Self {
             Self {
                 cells: vec![vec![' '; cols]; lines],
+                combining: vec![vec![String::new(); cols]; lines],
                 y: 0,
                 x: 0,
             }
@@ -5501,11 +5568,25 @@ mod output_tests {
         }
 
         fn print(&mut self, c: char) {
-            let width = crate::wide::char_width(c).max(1);
             let Some(line) = self.cells.get_mut(self.y) else {
                 return;
             };
+            if crate::wide::is_combining(c) {
+                // Joins the character before the cursor, which stays put.
+                let before = match self.x.checked_sub(1) {
+                    Some(x) if line[x] == '\0' => x.checked_sub(1),
+                    before => before,
+                };
+                if let Some(x) = before {
+                    self.combining[self.y][x].push(c);
+                }
+                return;
+            }
+            let width = crate::wide::char_width(c).max(1);
             if self.x + width <= line.len() {
+                for x in self.x..self.x + width {
+                    self.combining[self.y][x].clear();
+                }
                 // Writing over half of a double-width character blanks the
                 // other half.
                 if line[self.x] == '\0' {
@@ -5527,26 +5608,40 @@ mod output_tests {
             for line in &mut self.cells {
                 line.fill(c);
             }
+            for line in &mut self.combining {
+                line.fill(String::new());
+            }
         }
 
         /// The text of each line, without trailing blanks.
         fn rows(&self) -> Vec<String> {
             self.cells
                 .iter()
-                .map(|line| {
-                    let text: String = line.iter().filter(|c| **c != '\0').collect();
+                .zip(&self.combining)
+                .map(|(line, combining)| {
+                    let mut text = String::new();
+                    for (c, combining) in line.iter().zip(combining) {
+                        if *c != '\0' {
+                            text.push(*c);
+                            text.push_str(combining);
+                        }
+                    }
                     text.trim_end().to_string()
                 })
                 .collect()
         }
     }
 
-    /// A screen whose terminal is a file, and what that terminal would show.
+    /// A screen whose terminal is a file for output and a pipe for input,
+    /// and what that terminal would show.
     struct TestScreen {
         // Dropped first: dropping the screen still writes to the file.
         screen: Screen,
         shown: FakeTerminal,
         written: std::fs::File,
+        /// What is written here is what the screen reads as typed.
+        keyboard: std::io::PipeWriter,
+        _keyboard_reader: std::io::PipeReader,
         _terminal_file: tempfile::NamedTempFile,
     }
 
@@ -5556,8 +5651,12 @@ mod output_tests {
 
             let terminal_file = tempfile::NamedTempFile::new().unwrap();
             let written = terminal_file.reopen().unwrap();
-            let fd = terminal_file.as_file().as_raw_fd();
-            let terminal = Terminal::new(fd, fd).unwrap();
+            let (keyboard_reader, keyboard) = std::io::pipe().unwrap();
+            let terminal = Terminal::new(
+                keyboard_reader.as_raw_fd(),
+                terminal_file.as_file().as_raw_fd(),
+            )
+            .unwrap();
             assert!(terminal.is_no_tty());
             let colors = ColorManager::new(8, 64, false);
             let screen = Screen::from_parts(terminal, lines, cols, colors).unwrap();
@@ -5566,6 +5665,8 @@ mod output_tests {
                 screen,
                 shown: FakeTerminal::new(lines as usize, cols as usize),
                 written,
+                keyboard,
+                _keyboard_reader: keyboard_reader,
                 _terminal_file: terminal_file,
             };
             this.show();
@@ -5579,6 +5680,17 @@ mod output_tests {
             self.written.read_to_string(&mut output).unwrap();
             self.shown.feed(&output);
             output
+        }
+
+        /// Type `bytes` at the keyboard.
+        fn type_bytes(&mut self, bytes: &[u8]) {
+            use std::io::Write;
+            self.keyboard.write_all(bytes).unwrap();
+        }
+
+        /// Read `count` keys with `getch`.
+        fn read_keys(&mut self, count: usize) -> Vec<i32> {
+            (0..count).map(|_| self.screen.getch().unwrap()).collect()
         }
 
         /// Refresh the screen and return what the terminal shows.
@@ -5651,12 +5763,427 @@ mod output_tests {
     }
 
     #[test]
+    fn test_wrefresh_leaves_the_cursor_at_the_window_cursor() {
+        let mut t = TestScreen::new(5, 20);
+        let mut win = t.screen.newwin(2, 5, 1, 10).unwrap();
+        win.mvaddstr(0, 0, "ab").unwrap();
+        win.mv(1, 2).unwrap();
+        t.wrefresh(&mut win);
+        assert_eq!((t.shown.y, t.shown.x), (2, 12));
+
+        // Refreshing the standard screen puts it back at that one's cursor.
+        t.screen.mv(4, 3).unwrap();
+        t.refresh();
+        assert_eq!((t.shown.y, t.shown.x), (4, 3));
+    }
+
+    #[test]
+    fn test_wrefresh_with_leaveok_leaves_the_cursor_after_the_output() {
+        let mut t = TestScreen::new(5, 20);
+        let mut win = t.screen.newwin(2, 5, 1, 10).unwrap();
+        win.leaveok(true);
+        win.mvaddstr(0, 0, "ab").unwrap();
+        win.mv(1, 4).unwrap();
+        t.wrefresh(&mut win);
+        assert_eq!((t.shown.y, t.shown.x), (1, 12));
+    }
+
+    #[test]
+    fn test_wrefresh_marks_the_window_as_dealt_with() {
+        let mut t = TestScreen::new(4, 10);
+        let mut win = t.screen.newwin(2, 5, 1, 1).unwrap();
+        win.mvaddstr(0, 0, "win").unwrap();
+        assert!(win.is_wintouched());
+        t.wrefresh(&mut win);
+        assert!(!win.is_wintouched());
+
+        // The standard screen draws over the window. Refreshing the
+        // unchanged window again does not bring its old text back.
+        t.screen.mvaddstr(1, 0, "stdscr").unwrap();
+        assert_eq!(t.refresh()[1], "stdscr");
+        assert_eq!(t.wrefresh(&mut win)[1], "stdscr");
+    }
+
+    #[test]
+    fn test_wrefresh_keeps_the_changes_waiting_on_the_standard_screen() {
+        let mut t = TestScreen::new(4, 12);
+        let mut win = t.screen.newwin(1, 3, 2, 0).unwrap();
+        win.addstr("win").unwrap();
+
+        // Written but not refreshed yet.
+        t.screen.mvaddstr(0, 0, "waiting").unwrap();
+        assert_eq!(t.wrefresh(&mut win), ["", "", "win", ""]);
+        assert_eq!(t.refresh(), ["waiting", "", "win", ""]);
+    }
+
+    #[test]
+    fn test_doupdate_shows_every_window_copied_with_wnoutrefresh() {
+        let mut t = TestScreen::new(3, 10);
+        let mut first = t.screen.newwin(1, 3, 0, 0).unwrap();
+        let mut second = t.screen.newwin(1, 3, 2, 4).unwrap();
+        first.addstr("one").unwrap();
+        second.addstr("tw").unwrap();
+        t.screen.wnoutrefresh(&mut first).unwrap();
+        t.screen.wnoutrefresh(&mut second).unwrap();
+        assert!(t.show().is_empty());
+
+        t.screen.doupdate().unwrap();
+        t.show();
+        assert_eq!(t.shown.rows(), ["one", "", "    tw"]);
+        // The cursor is where the last window copied has its cursor.
+        assert_eq!((t.shown.y, t.shown.x), (2, 6));
+    }
+
+    #[test]
+    fn test_resize_term_keeps_the_standard_screen() {
+        let mut t = TestScreen::new(3, 10);
+        t.screen.stdscr_mut().keypad(true);
+        t.screen.stdscr_mut().scrollok(true);
+        t.screen.attron(attr::A_BOLD).unwrap();
+        t.screen.mvaddstr(0, 0, "kept").unwrap();
+        t.screen.mvaddstr(2, 5, "edge").unwrap();
+        t.refresh();
+
+        t.screen.resize_term(5, 20).unwrap();
+        let stdscr = t.screen.stdscr();
+        assert_eq!((stdscr.getmaxy(), stdscr.getmaxx()), (5, 20));
+        assert!(stdscr.is_keypad());
+        assert!(stdscr.is_scrollok());
+        assert_eq!(stdscr.getattrs(), attr::A_BOLD);
+        assert_eq!((stdscr.getcury(), stdscr.getcurx()), (2, 9));
+
+        // The terminal is repainted from scratch at its new size.
+        t.shown = FakeTerminal::new(5, 20);
+        t.shown.fill('#');
+        assert_eq!(t.refresh(), ["kept", "", "     edge", "", ""]);
+
+        // The new lines are part of the screen.
+        t.screen.mvaddstr(4, 15, "new").unwrap();
+        assert_eq!(t.refresh()[4], "               new");
+    }
+
+    #[test]
+    fn test_resize_term_to_a_smaller_size_cuts_the_contents_off() {
+        let mut t = TestScreen::new(4, 10);
+        t.screen.mvaddstr(0, 0, "abcdefgh").unwrap();
+        t.screen.mvaddstr(3, 0, "gone").unwrap();
+        t.refresh();
+
+        t.screen.resize_term(2, 5).unwrap();
+        let stdscr = t.screen.stdscr();
+        assert_eq!((stdscr.getmaxy(), stdscr.getmaxx()), (2, 5));
+        assert_eq!((stdscr.getcury(), stdscr.getcurx()), (1, 4));
+
+        t.shown = FakeTerminal::new(2, 5);
+        t.shown.fill('#');
+        assert_eq!(t.refresh(), ["abcde", ""]);
+    }
+
+    #[test]
+    fn test_refresh_after_endwin_returns_to_curses_mode() {
+        let mut t = TestScreen::new(3, 10);
+        t.screen.mvaddstr(0, 0, "before").unwrap();
+        t.refresh();
+
+        t.screen.endwin().unwrap();
+        assert!(t.screen.isendwin());
+        let output = t.show();
+        assert!(output.contains("\x1b[?1049l"), "{output:?}");
+
+        // The shell has written over the terminal in the meantime.
+        t.shown.fill('#');
+        t.screen.mvaddstr(1, 0, "back").unwrap();
+        t.screen.refresh().unwrap();
+        assert!(!t.screen.isendwin());
+        let output = t.show();
+        assert!(output.contains("\x1b[?1049h"), "{output:?}");
+        assert_eq!(t.shown.rows(), ["before", "back", ""]);
+
+        // Later refreshes are ordinary ones again.
+        t.screen.mvaddstr(2, 0, "on").unwrap();
+        t.screen.refresh().unwrap();
+        let output = t.show();
+        assert!(!output.contains("\x1b[?1049h"), "{output:?}");
+        assert_eq!(t.shown.rows(), ["before", "back", "on"]);
+    }
+
+    #[test]
+    fn test_wrefresh_after_endwin_returns_to_curses_mode() {
+        let mut t = TestScreen::new(3, 10);
+        let mut win = t.screen.newwin(1, 4, 1, 1).unwrap();
+        t.screen.endwin().unwrap();
+        t.show();
+
+        win.addstr("win").unwrap();
+        t.wrefresh(&mut win);
+        assert!(!t.screen.isendwin());
+        assert_eq!(t.shown.rows(), ["", " win", ""]);
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_returning_from_endwin_switches_mouse_reports_back_on() {
+        use crate::mouse::*;
+
+        let on = MouseProtocol::Sgr.enable_sequence();
+        let off = MouseProtocol::Sgr.disable_sequence();
+
+        let mut t = keypad_screen();
+        t.screen.mousemask(ALL_MOUSE_EVENTS);
+        t.screen.mouseinterval(10_000);
+        assert!(t.show().contains(on));
+
+        t.screen.endwin().unwrap();
+        let output = t.show();
+        assert!(output.contains(off) && !output.contains(on), "{output:?}");
+        assert!(t.screen.has_mouse());
+
+        t.screen.refresh().unwrap();
+        let output = t.show();
+        assert!(output.contains(on) && !output.contains(off), "{output:?}");
+
+        // Mouse reports are decoded as before.
+        t.type_bytes(b"\x1b[<0;3;2M");
+        assert_eq!(t.read_keys(1), [KEY_MOUSE]);
+        assert_eq!(t.screen.getmouse().unwrap().bstate, BUTTON1_PRESSED);
+
+        // Without a mouse mask nothing is switched on.
+        let mut t = keypad_screen();
+        t.screen.endwin().unwrap();
+        t.screen.refresh().unwrap();
+        assert!(!t.show().contains(on));
+
+        // A mask cleared while curses mode is left stays cleared.
+        let mut t = keypad_screen();
+        t.screen.mousemask(ALL_MOUSE_EVENTS);
+        t.screen.endwin().unwrap();
+        t.screen.mousemask(0);
+        t.show();
+        t.screen.refresh().unwrap();
+        assert!(!t.show().contains(on));
+    }
+
+    #[test]
+    fn test_returning_from_endwin_restores_the_cursor_visibility() {
+        for (visibility, sequence) in [(0, "\x1b[?25l"), (1, "\x1b[?25h")] {
+            let mut t = TestScreen::new(2, 10);
+            t.screen.curs_set(visibility).unwrap();
+            t.screen.endwin().unwrap();
+            t.show();
+
+            t.screen.refresh().unwrap();
+            let output = t.show();
+            let last = output.rfind("\x1b[?25").map(|at| &output[at..at + 6]);
+            assert_eq!(last, Some(sequence), "{output:?}");
+        }
+    }
+
+    /// A screen with keypad mode on and a short escape delay.
+    fn keypad_screen() -> TestScreen {
+        let mut t = TestScreen::new(3, 10);
+        t.screen.stdscr_mut().keypad(true);
+        t.screen.set_escdelay(30);
+        t
+    }
+
+    #[test]
+    fn test_getch_reads_typed_bytes() {
+        let mut t = TestScreen::new(3, 10);
+        t.type_bytes(b"ab\x1b[A");
+        // Without keypad mode an escape sequence is read byte by byte.
+        let keys = [b'a', b'b', 0x1b, b'[', b'A'].map(i32::from);
+        assert_eq!(t.read_keys(5), keys);
+    }
+
+    #[test]
+    fn test_getch_turns_known_escape_sequences_into_keys() {
+        use crate::key::{KEY_SR, KEY_UP};
+
+        let mut t = keypad_screen();
+        t.type_bytes(b"\x1b[A\x1b[1;2Ax");
+        assert_eq!(t.read_keys(3), [KEY_UP, KEY_SR, i32::from(b'x')]);
+    }
+
+    #[test]
+    fn test_getch_hands_back_every_byte_of_an_unknown_escape_sequence() {
+        let mut t = keypad_screen();
+        // Ctrl+Up: not a sequence the parser knows.
+        t.type_bytes(b"\x1b[1;5Ax");
+        let keys = [0x1b, b'[', b'1', b';', b'5', b'A', b'x'].map(i32::from);
+        assert_eq!(t.read_keys(7), keys);
+    }
+
+    #[test]
+    fn test_getch_hands_back_an_escape_sequence_that_stops_short() {
+        let mut t = keypad_screen();
+        t.type_bytes(b"\x1b[1;");
+        assert_eq!(t.read_keys(4), [0x1b, b'[', b'1', b';'].map(i32::from));
+
+        // A lone ESC is the Escape key.
+        t.type_bytes(b"\x1b");
+        assert_eq!(t.read_keys(1), [0x1b]);
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_getch_reports_mouse_events_in_the_order_they_happened() {
+        use crate::mouse::*;
+
+        let mut t = keypad_screen();
+        t.screen.mousemask(ALL_MOUSE_EVENTS);
+        t.screen.mouseinterval(10_000);
+        t.type_bytes(b"\x1b[<0;3;2M\x1b[<0;3;2m");
+        assert_eq!(t.read_keys(2), [KEY_MOUSE, KEY_MOUSE]);
+
+        let press = t.screen.getmouse().unwrap();
+        assert_eq!((press.x, press.y, press.bstate), (2, 1, BUTTON1_PRESSED));
+        // Released straight away: the release is also a click.
+        let release = t.screen.getmouse().unwrap();
+        assert_eq!(release.bstate, BUTTON1_RELEASED | BUTTON1_CLICKED);
+        assert!(t.screen.getmouse().is_none());
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_getch_reports_only_the_mouse_events_asked_for() {
+        use crate::mouse::*;
+
+        let mut t = keypad_screen();
+        t.screen.mousemask(BUTTON1_CLICKED);
+        t.screen.mouseinterval(10_000);
+        t.type_bytes(b"\x1b[<0;3;2M\x1b[<0;3;2mx");
+        // The press is not asked for; the click made by the release is.
+        assert_eq!(t.read_keys(2), [KEY_MOUSE, i32::from(b'x')]);
+        let click = t.screen.getmouse().unwrap();
+        assert_eq!((click.x, click.y, click.bstate), (2, 1, BUTTON1_CLICKED));
+        assert!(t.screen.getmouse().is_none());
+
+        // A press alone is skipped, and the next key is returned.
+        t.type_bytes(b"\x1b[<2;1;1My");
+        assert_eq!(t.read_keys(1), [i32::from(b'y')]);
+        assert!(t.screen.getmouse().is_none());
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_getch_hands_back_a_malformed_mouse_report() {
+        use crate::mouse::ALL_MOUSE_EVENTS;
+
+        let mut t = keypad_screen();
+        t.screen.mousemask(ALL_MOUSE_EVENTS);
+        // Column 0 does not exist: positions start at 1.
+        t.type_bytes(b"\x1b[<0;0;1M");
+        let keys = [0x1b, b'[', b'<', b'0', b';', b'0', b';', b'1', b'M'].map(i32::from);
+        assert_eq!(t.read_keys(9), keys);
+        assert!(t.screen.getmouse().is_none());
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_wmouse_trafo_takes_the_window_edges_into_account() {
+        let t = TestScreen::new(10, 20);
+        let win = t.screen.newwin(3, 4, 2, 5).unwrap();
+        let to_window = |y: i32, x: i32| {
+            let (mut wy, mut wx) = (y, x);
+            t.screen
+                .wmouse_trafo(&win, &mut wy, &mut wx, false)
+                .then_some((wy, wx))
+        };
+        assert_eq!(to_window(2, 5), Some((0, 0)));
+        assert_eq!(to_window(4, 8), Some((2, 3)));
+        // One past the last line or column is outside.
+        assert_eq!(to_window(5, 8), None);
+        assert_eq!(to_window(4, 9), None);
+        assert_eq!(to_window(1, 5), None);
+        assert_eq!(to_window(2, 4), None);
+
+        let (mut y, mut x) = (2, 3);
+        assert!(t.screen.wmouse_trafo(&win, &mut y, &mut x, true));
+        assert_eq!((y, x), (4, 8));
+    }
+
+    #[test]
+    fn test_reset_prog_mode_comes_back_to_the_modes_set_at_start() {
+        use crate::terminal::tty_tests::{local_flags, open_pty};
+        use std::os::fd::AsRawFd;
+
+        let pty = open_pty();
+        let fd = pty.terminal_side.as_raw_fd();
+        let terminal = Terminal::new(fd, fd).unwrap();
+        let colors = ColorManager::new(8, 64, false);
+        let mut screen = Screen::from_parts(terminal, 5, 20, colors).unwrap();
+        // A screen starts in cbreak mode without echo.
+        assert_eq!(local_flags(fd) & (libc::ICANON | libc::ECHO), 0);
+
+        // Out to a shell, which gets its own settings back.
+        screen.reset_shell_mode().unwrap();
+        assert_ne!(local_flags(fd) & (libc::ICANON | libc::ECHO), 0);
+        // Back: not the shell's cooked, echoing mode.
+        screen.reset_prog_mode().unwrap();
+        assert_eq!(local_flags(fd) & (libc::ICANON | libc::ECHO), 0);
+
+        // A mode recorded later is the one that comes back.
+        screen.echo().unwrap();
+        screen.def_prog_mode().unwrap();
+        screen.noecho().unwrap();
+        screen.reset_prog_mode().unwrap();
+        assert_ne!(local_flags(fd) & libc::ECHO, 0);
+    }
+
+    #[test]
+    fn test_standout_is_sent_as_reverse_video() {
+        let mut t = TestScreen::new(2, 10);
+        t.screen.attron(attr::A_STANDOUT).unwrap();
+        t.screen.addstr("S").unwrap();
+        t.screen.attroff(attr::A_STANDOUT).unwrap();
+        t.screen.refresh().unwrap();
+        let output = t.show();
+        let (before, _) = output.split_once('S').unwrap();
+        assert!(before.contains("\x1b[0;7m"), "{output:?}");
+
+        // `standout` and `standend` switch the same attribute.
+        t.screen.stdscr_mut().standout().unwrap();
+        t.screen.addstr("T").unwrap();
+        t.screen.stdscr_mut().standend().unwrap();
+        t.screen.addstr("u").unwrap();
+        t.screen.refresh().unwrap();
+        let output = t.show();
+        let (before, after) = output.split_once('T').unwrap();
+        assert!(before.contains("\x1b[0;7m"), "{output:?}");
+        // Reverse video is switched off again before the next character.
+        let (between, _) = after.split_once('u').unwrap();
+        assert!(between.contains("\x1b[0m"), "{output:?}");
+    }
+
+    #[test]
     fn test_text_after_a_double_width_character_stays_in_its_column() {
         let mut t = TestScreen::new(2, 10);
         t.screen.mvaddstr(0, 0, "日本ab").unwrap();
         assert_eq!(t.refresh(), ["日本ab", ""]);
         // Each double-width character takes two columns and no more.
         assert_eq!(t.shown.cells[0][..6], ['日', '\0', '本', '\0', 'a', 'b']);
+    }
+
+    #[test]
+    fn test_double_width_character_in_the_last_column_wraps() {
+        let mut t = TestScreen::new(2, 5);
+        t.screen.mvaddstr(0, 3, "a日x").unwrap();
+        assert_eq!(t.refresh(), ["   a", "日x"]);
+    }
+
+    #[test]
+    fn test_combining_characters_are_drawn_on_their_base_character() {
+        let mut t = TestScreen::new(2, 6);
+        t.screen.mvaddstr(0, 0, "e\u{301}x").unwrap();
+        t.screen.mvaddstr(1, 0, "日\u{301}y").unwrap();
+        assert_eq!(t.refresh(), ["e\u{301}x", "日\u{301}y"]);
+        // The combining character takes no column of its own.
+        assert_eq!(t.shown.cells[0][..2], ['e', 'x']);
+        assert_eq!(t.shown.cells[1][..3], ['日', '\0', 'y']);
+
+        // Overwriting the base character removes its combining character.
+        t.screen.mvaddstr(0, 0, "a").unwrap();
+        assert_eq!(t.refresh(), ["ax", "日\u{301}y"]);
     }
 
     #[test]

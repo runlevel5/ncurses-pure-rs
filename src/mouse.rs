@@ -4,6 +4,7 @@
 //! must be enabled with the `mouse` feature flag.
 
 use crate::types::MmaskT;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 // ============================================================================
@@ -274,14 +275,14 @@ pub struct MouseState {
     enabled: bool,
     /// Last mouse event.
     last_event: MouseEvent,
-    /// Mouse event queue.
-    event_queue: Vec<MouseEvent>,
+    /// Mouse event queue, oldest event first.
+    event_queue: VecDeque<MouseEvent>,
     /// Click interval in milliseconds.
     click_interval: i32,
     /// Click tracker for double/triple click detection.
     click_tracker: ClickTracker,
-    /// Track which buttons are currently pressed.
-    buttons_pressed: [bool; 5],
+    /// When each button that is currently down was pressed.
+    buttons_pressed: [Option<Instant>; 5],
 }
 
 impl MouseState {
@@ -293,10 +294,10 @@ impl MouseState {
             old_mask: 0,
             enabled: false,
             last_event: MouseEvent::new(),
-            event_queue: Vec::new(),
+            event_queue: VecDeque::new(),
             click_interval,
             click_tracker: ClickTracker::new(click_interval),
-            buttons_pressed: [false; 5],
+            buttons_pressed: [None; 5],
         }
     }
 
@@ -318,48 +319,59 @@ impl MouseState {
         self.enabled
     }
 
-    /// Get the next mouse event from the queue.
+    /// Get the next mouse event from the queue: the oldest one waiting.
     pub fn getmouse(&mut self) -> Option<MouseEvent> {
-        self.event_queue.pop()
+        self.event_queue.pop_front()
     }
 
-    /// Push a mouse event to the queue.
-    pub fn push_event(&mut self, event: MouseEvent) {
-        // Filter by mask
-        if (event.bstate & self.mask) != 0 {
-            self.last_event = event;
-            self.event_queue.push(event);
-        }
-    }
-
-    /// Process a raw mouse event and push it with click detection.
+    /// Add a mouse event to the queue, if the mouse mask asks for it, and
+    /// say whether it was added.
     ///
-    /// This handles converting press/release events into click events
-    /// with proper double/triple click detection.
-    pub fn process_event(&mut self, mut event: MouseEvent) {
+    /// Only the parts of the event that the mask asks for are reported.
+    pub fn push_event(&mut self, mut event: MouseEvent) -> bool {
+        event.bstate &= self.mask;
+        if event.bstate == 0 {
+            return false;
+        }
+        self.last_event = event;
+        self.event_queue.push_back(event);
+        true
+    }
+
+    /// Process a raw mouse event and push it with click detection, and say
+    /// whether it was added to the queue.
+    ///
+    /// A button released within the click interval of being pressed is a
+    /// click, and the release event is marked as one, with double and
+    /// triple clicks told apart. A click interval of 0 turns this off.
+    pub fn process_event(&mut self, mut event: MouseEvent) -> bool {
         // Check for button press/release and track clicks
         for button in 0..5 {
             let pressed_mask = BUTTON_PRESSED[button];
             let released_mask = BUTTON_RELEASED[button];
 
             if event.has_button(pressed_mask) {
-                self.buttons_pressed[button] = true;
+                self.buttons_pressed[button] = Some(Instant::now());
             }
 
-            if event.has_button(released_mask) && self.buttons_pressed[button] {
-                self.buttons_pressed[button] = false;
+            if event.has_button(released_mask)
+                && let Some(pressed) = self.buttons_pressed[button].take()
+                && self.click_interval > 0
+                && pressed.elapsed().as_millis() <= self.click_interval as u128
+            {
                 // Record the release and get click type
                 let click_mask = self.click_tracker.record_release(button, event.x, event.y);
                 event.bstate |= click_mask;
             }
         }
 
-        self.push_event(event);
+        self.push_event(event)
     }
 
-    /// Push an event back to the front of the queue.
+    /// Push an event back to the front of the queue, so that the next
+    /// `getmouse` returns it.
     pub fn ungetmouse(&mut self, event: MouseEvent) -> bool {
-        self.event_queue.insert(0, event);
+        self.event_queue.push_front(event);
         true
     }
 
@@ -481,12 +493,13 @@ pub fn parse_sgr_mouse(data: &[u8]) -> Option<MouseEvent> {
     }
 
     let cb: u32 = parts[0].parse().ok()?;
-    let cx: i32 = parts[1].parse().ok()?;
-    let cy: i32 = parts[2].parse().ok()?;
+    let cx: u32 = parts[1].parse().ok()?;
+    let cy: u32 = parts[2].parse().ok()?;
 
-    // Convert to 0-based coordinates
-    let x = cx - 1;
-    let y = cy - 1;
+    // Convert to 0-based coordinates. They are 1-based on the wire: a
+    // terminal never sends 0, and nothing here may trust it not to.
+    let x = i32::try_from(cx.checked_sub(1)?).ok()?;
+    let y = i32::try_from(cy.checked_sub(1)?).ok()?;
 
     // Decode button
     let button = cb & 0x03;
@@ -812,6 +825,123 @@ mod tests {
         let got = state.getmouse().unwrap();
         assert_eq!(got.x, 10);
         assert_eq!(got.y, 20);
+    }
+
+    fn event(x: i32, bstate: MmaskT) -> MouseEvent {
+        MouseEvent {
+            id: 0,
+            x,
+            y: 0,
+            z: 0,
+            bstate,
+        }
+    }
+
+    #[test]
+    fn test_mouse_events_come_out_in_the_order_they_went_in() {
+        let mut state = MouseState::new();
+        state.mousemask(ALL_MOUSE_EVENTS);
+        assert!(state.push_event(event(1, BUTTON1_PRESSED)));
+        assert!(state.push_event(event(2, BUTTON1_RELEASED)));
+        assert!(state.push_event(event(3, BUTTON2_PRESSED)));
+        let order: Vec<i32> = std::iter::from_fn(|| state.getmouse())
+            .map(|e| e.x)
+            .collect();
+        assert_eq!(order, [1, 2, 3]);
+        assert!(!state.has_events());
+    }
+
+    #[test]
+    fn test_ungetmouse_event_is_the_next_one_returned() {
+        let mut state = MouseState::new();
+        state.mousemask(ALL_MOUSE_EVENTS);
+        state.push_event(event(1, BUTTON1_PRESSED));
+        state.push_event(event(2, BUTTON1_RELEASED));
+        let first = state.getmouse().unwrap();
+        assert!(state.ungetmouse(first));
+        assert_eq!(state.getmouse().unwrap().x, 1);
+        assert_eq!(state.getmouse().unwrap().x, 2);
+    }
+
+    #[test]
+    fn test_mouse_mask_filters_events_and_what_they_report() {
+        let mut state = MouseState::new();
+        state.mousemask(BUTTON1_CLICKED | BUTTON2_PRESSED);
+        assert!(!state.push_event(event(1, BUTTON1_PRESSED)));
+        assert!(!state.has_events());
+        assert!(state.push_event(event(2, BUTTON1_RELEASED | BUTTON1_CLICKED)));
+        assert_eq!(state.getmouse().unwrap().bstate, BUTTON1_CLICKED);
+
+        // With no mask nothing is queued.
+        state.mousemask(0);
+        assert!(!state.push_event(event(3, BUTTON1_CLICKED)));
+    }
+
+    #[test]
+    fn test_process_event_marks_a_quick_release_as_a_click() {
+        let mut state = MouseState::new();
+        state.mousemask(ALL_MOUSE_EVENTS);
+        state.mouseinterval(10_000);
+        assert!(state.process_event(event(1, BUTTON1_PRESSED)));
+        assert!(state.process_event(event(1, BUTTON1_RELEASED)));
+        assert_eq!(state.getmouse().unwrap().bstate, BUTTON1_PRESSED);
+        assert_eq!(
+            state.getmouse().unwrap().bstate,
+            BUTTON1_RELEASED | BUTTON1_CLICKED
+        );
+
+        // A second click in the same place is a double click.
+        state.process_event(event(1, BUTTON1_PRESSED));
+        state.process_event(event(1, BUTTON1_RELEASED));
+        state.getmouse();
+        assert_eq!(
+            state.getmouse().unwrap().bstate,
+            BUTTON1_RELEASED | BUTTON1_DOUBLE_CLICKED
+        );
+    }
+
+    #[test]
+    fn test_process_event_without_a_click() {
+        // A release with no press before it is not a click.
+        let mut state = MouseState::new();
+        state.mousemask(ALL_MOUSE_EVENTS);
+        state.mouseinterval(10_000);
+        state.process_event(event(1, BUTTON1_RELEASED));
+        assert_eq!(state.getmouse().unwrap().bstate, BUTTON1_RELEASED);
+
+        // A click interval of 0 turns click detection off.
+        state.mouseinterval(0);
+        state.process_event(event(1, BUTTON1_PRESSED));
+        state.process_event(event(1, BUTTON1_RELEASED));
+        state.getmouse();
+        assert_eq!(state.getmouse().unwrap().bstate, BUTTON1_RELEASED);
+
+        // A button held longer than the interval is not a click.
+        state.mouseinterval(1);
+        state.process_event(event(1, BUTTON1_PRESSED));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        state.process_event(event(1, BUTTON1_RELEASED));
+        state.getmouse();
+        assert_eq!(state.getmouse().unwrap().bstate, BUTTON1_RELEASED);
+    }
+
+    #[test]
+    fn test_parse_sgr_mouse_rejects_positions_out_of_range() {
+        for report in [
+            &b"\x1b[<0;-2147483648;1M"[..],
+            b"\x1b[<0;1;-2147483648M",
+            b"\x1b[<0;-1;1M",
+            b"\x1b[<0;0;1M",
+            b"\x1b[<0;1;0M",
+            b"\x1b[<0;4294967295;1M",
+            b"\x1b[<0;99999999999;1M",
+            b"\x1b[<-1;1;1M",
+        ] {
+            assert!(parse_sgr_mouse(report).is_none(), "{report:?}");
+        }
+
+        let far = parse_sgr_mouse(b"\x1b[<0;2147483647;1M").unwrap();
+        assert_eq!((far.x, far.y), (i32::MAX - 1, 0));
     }
 
     #[test]

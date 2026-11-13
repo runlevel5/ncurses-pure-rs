@@ -305,8 +305,33 @@ impl Window {
             return Err(Error::InvalidArgument("negative window dimensions".into()));
         }
 
-        let height = if nlines == 0 { 24 } else { nlines } as usize;
-        let width = if ncols == 0 { 80 } else { ncols } as usize;
+        // A size of 0 means the rest of the screen from the window's origin
+        let nlines = if nlines == 0 {
+            crate::screen::globals::LINES() - begy
+        } else {
+            nlines
+        };
+        let ncols = if ncols == 0 {
+            crate::screen::globals::COLS() - begx
+        } else {
+            ncols
+        };
+        if nlines <= 0 || ncols <= 0 {
+            return Err(Error::InvalidArgument(
+                "window origin is outside the screen".into(),
+            ));
+        }
+
+        // Sizes and positions are kept as `NcursesSize`
+        let limit = i32::from(NcursesSize::MAX);
+        if nlines > limit || ncols > limit || begy > limit || begx > limit {
+            return Err(Error::InvalidArgument(format!(
+                "window dimensions must not be larger than {limit}"
+            )));
+        }
+
+        let height = nlines as usize;
+        let width = ncols as usize;
 
         let mut lines = Vec::with_capacity(height);
         for _ in 0..height {
@@ -521,6 +546,11 @@ impl Window {
         } else {
             ncols
         };
+        if height <= 0 || width <= 0 {
+            return Err(Error::InvalidArgument(
+                "subwindow origin leaves no room inside the parent".into(),
+            ));
+        }
 
         let mut win = Self::new(height, width, begy, begx)?;
         win.flags |= WindowFlags::SUBWIN;
@@ -570,6 +600,11 @@ impl Window {
             ncols
         };
 
+        if height <= 0 || width <= 0 {
+            return Err(Error::InvalidArgument(
+                "derived window origin leaves no room inside the parent".into(),
+            ));
+        }
         if begy + height > self.getmaxy() || begx + width > self.getmaxx() {
             return Err(Error::InvalidArgument(
                 "derived window extends beyond parent boundaries".into(),
@@ -801,11 +836,7 @@ impl Window {
             b'\n' => {
                 // Newline: clear to end of line and move to next line
                 self.clrtoeol()?;
-                if self.cury < self.maxy {
-                    self.cury += 1;
-                    self.curx = 0;
-                } else if self.scroll {
-                    self.scroll_up(1)?;
+                if self.next_line()? {
                     self.curx = 0;
                 }
                 return Ok(());
@@ -817,6 +848,9 @@ impl Window {
             b'\t' => {
                 // Tab: move to next tab stop (every 8 columns)
                 let next_tab = ((self.curx / 8) + 1) * 8;
+                if next_tab > self.maxx {
+                    return self.tab_past_the_right_edge();
+                }
                 let spaces = (next_tab - self.curx) as usize;
                 for _ in 0..spaces {
                     self.add_ch_internal(b' ' as ChType | (ch & !A_CHARTEXT))?;
@@ -860,11 +894,7 @@ impl Window {
         match c {
             '\n' => {
                 self.clrtoeol()?;
-                if self.cury < self.maxy {
-                    self.cury += 1;
-                    self.curx = 0;
-                } else if self.scroll {
-                    self.scroll_up(1)?;
+                if self.next_line()? {
                     self.curx = 0;
                 }
                 return Ok(());
@@ -875,6 +905,9 @@ impl Window {
             }
             '\t' => {
                 let next_tab = ((self.curx / 8) + 1) * 8;
+                if next_tab > self.maxx {
+                    return self.tab_past_the_right_edge();
+                }
                 let spaces = (next_tab - self.curx) as usize;
                 for _ in 0..spaces {
                     let space = CCharT::from_char_attr(' ', ch.attr);
@@ -895,17 +928,34 @@ impl Window {
             return Ok(());
         }
 
-        // Handle wide characters (2-column)
-        let width = ch.width();
-        if x + width > (self.maxx + 1) as usize {
-            // Character doesn't fit, wrap or don't draw
-            if self.scroll && y == self.maxy as usize {
-                // At bottom, need to scroll
-            }
-            // For now, just don't draw if it doesn't fit
-            self.advance_cursor()?;
+        // A combining character joins the character before the cursor.
+        if c != '\0' && crate::wide::is_combining(c) {
+            self.add_combining_before_cursor(c);
             return Ok(());
         }
+
+        let ch = self.render(ch);
+
+        // Handle wide characters (2-column)
+        let width = ch.width();
+        let columns = self.maxx as usize + 1;
+        let (x, y) = if x + width > columns {
+            if width > columns {
+                // Wider than the window: it can never be drawn.
+                return Ok(());
+            }
+            // No room left on this line: blank the last cell and wrap, so
+            // that the character starts the next line.
+            self.lines[y].set(x, self.bkgrnd);
+            self.advance_cursor()?;
+            if self.curx != 0 {
+                // The cursor could not wrap: bottom line, and no scrolling.
+                return Ok(());
+            }
+            (0, self.cury as usize)
+        } else {
+            (x, y)
+        };
 
         // Write the character
         self.lines[y].set(x, ch);
@@ -925,22 +975,90 @@ impl Window {
         Ok(())
     }
 
+    /// What `ch` becomes when it is written to this window: it takes on the
+    /// background's attributes, and its colour unless it has one of its own.
+    /// A blank with no attributes of its own becomes the background
+    /// character.
+    #[cfg(feature = "wide")]
+    fn render(&self, mut ch: CCharT) -> CCharT {
+        let background = &self.bkgrnd;
+        if ch.spacing_char() == ' ' && ch.char_count() == 1 && ch.attr & !self.attrs == 0 {
+            ch.chars = background.chars;
+        }
+        if ch.attr & attr::A_COLOR == 0 {
+            ch.attr |= background.attr & attr::A_COLOR;
+            #[cfg(feature = "ext-colors")]
+            if ch.ext_color == 0 {
+                ch.ext_color = background.ext_color;
+            }
+        }
+        ch.attr |= background.attr & !attr::A_COLOR;
+        ch
+    }
+
+    /// Attach a combining character to the character before the cursor.
+    ///
+    /// It is dropped when there is no character before the cursor on this
+    /// line, or when that character has no room for another one.
+    #[cfg(feature = "wide")]
+    fn add_combining_before_cursor(&mut self, combining: char) {
+        let y = self.cury as usize;
+        let Some(mut x) = (self.curx as usize).checked_sub(1) else {
+            return;
+        };
+        // Step over the second cell of a double-width character.
+        if x > 0 && self.lines[y].get(x).is_null() {
+            x -= 1;
+        }
+        let mut cell = self.lines[y].get(x);
+        if cell.add_combining(combining) {
+            self.lines[y].set(x, cell);
+        }
+    }
+
+    /// Handle a tab whose tab stop lies past the right edge: the rest of the
+    /// line is cleared and the cursor goes to the start of the next line,
+    /// not on to the tab stop it would have reached there.
+    fn tab_past_the_right_edge(&mut self) -> Result<()> {
+        self.clrtoeol()?;
+        self.flags |= WindowFlags::WRAPPED;
+        self.curx = if self.next_line()? { 0 } else { self.maxx };
+        Ok(())
+    }
+
     /// Advance the cursor after character output.
     fn advance_cursor(&mut self) -> Result<()> {
         self.curx += 1;
         if self.curx > self.maxx {
-            self.curx = 0;
             self.flags |= WindowFlags::WRAPPED;
-            if self.cury < self.maxy {
-                self.cury += 1;
-            } else if self.scroll {
-                self.scroll_up(1)?;
+            if self.next_line()? {
+                self.curx = 0;
             } else {
-                // Stay at bottom-right
+                // Stay at the right edge
                 self.curx = self.maxx;
             }
         }
         Ok(())
+    }
+
+    /// Move the cursor down a line, as a newline or a wrap at the right edge
+    /// does, and say whether it moved.
+    ///
+    /// On the last line of the scroll region the region scrolls up instead
+    /// and the cursor stays on that line, if scrolling is enabled; without
+    /// scrolling the cursor cannot move from there. On the last line of the
+    /// window, below the scroll region, nothing scrolls and the cursor
+    /// carries on at the start of that same line.
+    fn next_line(&mut self) -> Result<bool> {
+        if self.cury == self.regbottom {
+            if !self.scroll {
+                return Ok(false);
+            }
+            self.scroll_up(1)?;
+        } else if self.cury < self.maxy {
+            self.cury += 1;
+        }
+        Ok(true)
     }
 
     /// Add a string at the current position.
@@ -1167,12 +1285,10 @@ impl Window {
             }
             #[cfg(feature = "wide")]
             {
+                // An empty cell is the second half of a double-width
+                // character; a cell can also hold combining characters.
                 let cchar = self.lines[y].get(x);
-                let c = cchar.spacing_char();
-                if c == '\0' {
-                    break;
-                }
-                result.push(c);
+                result.extend(cchar.chars.iter().take_while(|c| **c != '\0'));
             }
         }
 
@@ -1499,9 +1615,7 @@ impl Window {
     /// Set the background and apply to entire window (wide character version).
     #[cfg(feature = "wide")]
     pub fn bkgd(&mut self, ch: ChType) -> Result<()> {
-        self.bkgrnd = CCharT::from_chtype(ch);
-        // For simplicity, just set background without full update
-        Ok(())
+        self.wbkgrnd(&CCharT::from_chtype(ch))
     }
 
     // ========================================================================
@@ -1985,8 +2099,14 @@ impl Window {
             cchar.attr |= self.attrs;
         }
 
+        // A double-width character takes two cells: the character, then an
+        // empty cell. It is not inserted where only one cell is left.
         let width = cchar.width().max(1);
-        self.lines[y].insert(x, cchar, width);
+        if x + width > self.maxx as usize + 1 {
+            return Ok(());
+        }
+        self.lines[y].insert(x, CCharT::new(), width);
+        self.lines[y].set(x, cchar);
 
         Ok(())
     }
@@ -2209,21 +2329,26 @@ impl Window {
         // Update all cells
         for line in &mut self.lines {
             for x in 0..line.width() {
-                let cell = line.get(x);
+                let mut cell = line.get(x);
                 let cell_char = cell.spacing_char();
-                let cell_attr = cell.attrs();
 
                 // Replace old background char with new
-                let updated_char = if cell_char == old_char || cell_char == ' ' {
-                    new_char
+                if cell_char == old_char || cell_char == ' ' {
+                    cell.chars[0] = new_char;
+                }
+
+                // Update attributes: remove old background attrs, add new
+                // ones. A cell in the old background's colour takes the new
+                // one; a cell with a colour of its own keeps it.
+                let color = attr::A_COLOR;
+                let cell_color = if cell.attr & color == old_attr & color {
+                    new_attr & color
                 } else {
-                    cell_char
+                    cell.attr & color
                 };
+                cell.attr = (cell.attr & !color & !old_attr) | (new_attr & !color) | cell_color;
 
-                // Update attributes: remove old background attrs, add new ones
-                let updated_attr = (cell_attr & !old_attr) | new_attr;
-
-                line.set(x, CCharT::from_char_attr(updated_char, updated_attr));
+                line.set(x, cell);
             }
         }
 
@@ -2857,6 +2982,156 @@ mod tests {
         assert_eq!(rows_of(&mut win, 2), ["▓▓"]);
     }
 
+    /// The character and attributes of a cell.
+    #[cfg(feature = "wide")]
+    fn cell(win: &Window, y: usize, x: usize) -> (char, AttrT) {
+        let cell = win.lines[y].get(x);
+        (cell.spacing_char(), cell.attr)
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_bkgd_repaints_the_window() {
+        let mut win = Window::new(2, 3, 0, 0).unwrap();
+        win.addstr("ab").unwrap();
+        win.bkgd('.' as ChType | A_BOLD).unwrap();
+        assert_eq!(rows(&mut win), ["ab.", "..."]);
+        assert_eq!(cell(&win, 0, 0), ('a', A_BOLD));
+        assert_eq!(cell(&win, 1, 2), ('.', A_BOLD));
+        assert_eq!(win.getbkgd(), '.' as ChType | A_BOLD);
+        win.mv(0, 2).unwrap();
+        assert_eq!(win.inch(), '.' as ChType | A_BOLD);
+        assert!(win.is_wintouched());
+
+        // A new background replaces the old one's character and attributes.
+        win.bkgd(' ' as ChType | A_UNDERLINE).unwrap();
+        assert_eq!(rows(&mut win), ["ab ", "   "]);
+        assert_eq!(cell(&win, 0, 0), ('a', A_UNDERLINE));
+        assert_eq!(cell(&win, 1, 2), (' ', A_UNDERLINE));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_characters_added_after_bkgd_take_the_background_attributes() {
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        win.bkgd('.' as ChType | A_BOLD).unwrap();
+        win.addch('z' as ChType).unwrap();
+        // A plain blank becomes the background character.
+        win.addch(' ' as ChType).unwrap();
+        // A blank with attributes of its own stays a blank.
+        win.addch(' ' as ChType | A_UNDERLINE).unwrap();
+        assert_eq!(cell(&win, 0, 0), ('z', A_BOLD));
+        assert_eq!(cell(&win, 0, 1), ('.', A_BOLD));
+        assert_eq!(cell(&win, 0, 2), (' ', A_BOLD | A_UNDERLINE));
+        assert_eq!(cell(&win, 0, 3), ('.', A_BOLD));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_background_colour_applies_unless_a_character_has_its_own() {
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        win.addch('a' as ChType | color_pair(3)).unwrap();
+        win.bkgd(' ' as ChType | color_pair(2)).unwrap();
+        win.addch('b' as ChType).unwrap();
+        win.addch('c' as ChType | color_pair(3) | A_BOLD).unwrap();
+        assert_eq!(cell(&win, 0, 0), ('a', color_pair(3)));
+        assert_eq!(cell(&win, 0, 1), ('b', color_pair(2)));
+        assert_eq!(cell(&win, 0, 2), ('c', color_pair(3) | A_BOLD));
+        assert_eq!(cell(&win, 0, 3), (' ', color_pair(2)));
+
+        // Changing the background colour recolours what had the old one.
+        win.bkgd(' ' as ChType | color_pair(5)).unwrap();
+        assert_eq!(cell(&win, 0, 0), ('a', color_pair(3)));
+        assert_eq!(cell(&win, 0, 1), ('b', color_pair(5)));
+        assert_eq!(cell(&win, 0, 3), (' ', color_pair(5)));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_bkgdset_only_affects_what_is_written_afterwards() {
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addch('a' as ChType).unwrap();
+        win.bkgdset('.' as ChType | A_BOLD);
+        assert_eq!(cell(&win, 0, 0), ('a', A_NORMAL));
+        assert_eq!(cell(&win, 0, 1), (' ', A_NORMAL));
+        win.addstr("b ").unwrap();
+        assert_eq!(cell(&win, 0, 1), ('b', A_BOLD));
+        assert_eq!(cell(&win, 0, 2), ('.', A_BOLD));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_bkgd_keeps_combining_characters() {
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addstr("e\u{301}").unwrap();
+        win.bkgd(' ' as ChType | A_BOLD).unwrap();
+        assert_eq!(win.lines[0].get(0).to_string(), "e\u{301}");
+        assert_eq!(cell(&win, 0, 0), ('e', A_BOLD));
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_window_without_a_background_writes_characters_unchanged() {
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.attron(A_UNDERLINE).unwrap();
+        win.addch('a' as ChType | A_BOLD).unwrap();
+        win.addch(' ' as ChType).unwrap();
+        assert_eq!(cell(&win, 0, 0), ('a', A_BOLD | A_UNDERLINE));
+        assert_eq!(cell(&win, 0, 1), (' ', A_UNDERLINE));
+    }
+
+    #[test]
+    fn test_window_size_of_zero_means_the_rest_of_the_screen() {
+        use crate::screen::globals::{COLS, LINES};
+
+        let (lines, cols) = (LINES(), COLS());
+        let whole = Window::new(0, 0, 0, 0).unwrap();
+        assert_eq!((whole.getmaxy(), whole.getmaxx()), (lines, cols));
+        let part = Window::new(0, 0, 3, 4).unwrap();
+        assert_eq!((part.getmaxy(), part.getmaxx()), (lines - 3, cols - 4));
+        let mixed = Window::new(2, 0, 0, 10).unwrap();
+        assert_eq!((mixed.getmaxy(), mixed.getmaxx()), (2, cols - 10));
+
+        // An origin on or past the screen's edge leaves no room.
+        assert!(Window::new(0, 0, lines, 0).is_err());
+        assert!(Window::new(0, 0, 0, cols).is_err());
+        assert!(Window::new(0, 5, lines + 1, 0).is_err());
+    }
+
+    #[test]
+    fn test_window_dimensions_have_to_fit_their_type() {
+        assert!(Window::new(40_000, 2, 0, 0).is_err());
+        assert!(Window::new(2, 40_000, 0, 0).is_err());
+        assert!(Window::new(2, 2, 40_000, 0).is_err());
+        assert!(Window::new(2, 2, 0, 40_000).is_err());
+        assert!(Window::new(i32::MAX, i32::MAX, 0, 0).is_err());
+        assert!(Window::new_pad(40_000, 2).is_err());
+        assert!(Window::new(-1, 5, 0, 0).is_err());
+
+        // The largest size there is still works.
+        let tall = Window::new(32_767, 1, 0, 0).unwrap();
+        assert_eq!((tall.getmaxy(), tall.getmaxx()), (32_767, 1));
+        let pad = Window::new_pad(1, 32_767).unwrap();
+        assert_eq!(pad.getmaxx(), 32_767);
+    }
+
+    #[test]
+    fn test_subwindow_size_of_zero_means_the_rest_of_the_parent() {
+        let parent = Window::new(5, 5, 10, 20).unwrap();
+
+        let derived = parent.derwin(0, 0, 2, 2).unwrap();
+        assert_eq!((derived.getmaxy(), derived.getmaxx()), (3, 3));
+        assert_eq!((derived.getbegy(), derived.getbegx()), (12, 22));
+        let sub = parent.subwin(0, 0, 12, 22).unwrap();
+        assert_eq!((sub.getmaxy(), sub.getmaxx()), (3, 3));
+
+        // At the parent's far corner there is nothing left to give.
+        assert!(parent.derwin(0, 0, 5, 5).is_err());
+        assert!(parent.derwin(0, 2, 5, 0).is_err());
+        assert!(parent.subwin(0, 0, 15, 25).is_err());
+        assert!(parent.subwin(2, 0, 10, 25).is_err());
+    }
+
     #[test]
     fn test_border_of_a_one_cell_window_does_not_panic() {
         for (lines, cols) in [(1, 1), (1, 4), (4, 1), (2, 2)] {
@@ -3035,6 +3310,281 @@ mod tests {
         win.mv(1, 0).unwrap();
         win.insdelln(-1).unwrap();
         assert_eq!(rows(&mut win), ["aaa", "ccc", "ddd", "eee", "   "]);
+    }
+
+    /// The spacing character of each cell of a line.
+    #[cfg(feature = "wide")]
+    fn cells(win: &Window, y: usize) -> Vec<char> {
+        (0..win.lines[y].width())
+            .map(|x| win.lines[y].get(x).spacing_char())
+            .collect()
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_double_width_character_takes_two_cells() {
+        let mut win = Window::new(1, 6, 0, 0).unwrap();
+        win.addstr("日本x").unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', '本', '\0', 'x', ' ']);
+        assert_eq!(win.getcurx(), 5);
+
+        // Reading the line back gives the text, not just its first character.
+        win.mv(0, 0).unwrap();
+        assert_eq!(win.instr(-1), "日本x ");
+        assert_eq!(win.instr(3), "日本");
+        win.mv(0, 2).unwrap();
+        assert_eq!(win.instr(-1), "本x ");
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_double_width_character_in_the_last_column_wraps() {
+        let mut win = Window::new(2, 5, 0, 0).unwrap();
+        win.mvaddstr(0, 3, "a日x").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 3));
+        assert_eq!(cells(&win, 0), [' ', ' ', ' ', 'a', ' ']);
+        assert_eq!(cells(&win, 1), ['日', '\0', 'x', ' ', ' ']);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_double_width_character_in_the_last_cell_of_the_window() {
+        // Without scrolling there is nowhere to wrap to: it is not drawn.
+        let mut win = Window::new(2, 5, 0, 0).unwrap();
+        win.mvaddstr(1, 4, "日").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 4));
+        assert_eq!(cells(&win, 1), [' '; 5]);
+
+        // With scrolling the window scrolls and it starts the new line.
+        let mut win = Window::new(2, 5, 0, 0).unwrap();
+        win.scrollok(true);
+        win.mvaddstr(0, 0, "top").unwrap();
+        win.mvaddstr(1, 3, "a日").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 2));
+        assert_eq!(cells(&win, 0), [' ', ' ', ' ', 'a', ' ']);
+        assert_eq!(cells(&win, 1), ['日', '\0', ' ', ' ', ' ']);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_double_width_character_wider_than_the_window_is_not_drawn() {
+        let mut win = Window::new(2, 1, 0, 0).unwrap();
+        win.addstr("日a").unwrap();
+        assert_eq!(cells(&win, 0), ['a']);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_combining_character_joins_the_character_before_it() {
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        win.addstr("e\u{301}x").unwrap();
+        assert_eq!(win.getcurx(), 2);
+        assert_eq!(cells(&win, 0), ['e', 'x', ' ', ' ']);
+        assert_eq!(win.lines[0].get(0).to_string(), "e\u{301}");
+        win.mv(0, 0).unwrap();
+        assert_eq!(win.instr(-1), "e\u{301}x  ");
+
+        // After a double-width character it joins that character.
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        win.addstr("日\u{301}").unwrap();
+        assert_eq!(win.getcurx(), 2);
+        assert_eq!(win.lines[0].get(0).to_string(), "日\u{301}");
+        assert!(win.lines[0].get(1).is_null());
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_combining_character_with_nothing_to_join_is_dropped() {
+        // At the start of a line.
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addstr("\u{301}a").unwrap();
+        assert_eq!(cells(&win, 0), ['a', ' ', ' ']);
+        assert_eq!(win.lines[0].get(0).to_string(), "a");
+
+        // When the character already has all it can hold.
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addstr("a\u{301}\u{302}\u{303}\u{304}\u{305}\u{306}b")
+            .unwrap();
+        let held = crate::types::CCHARW_MAX - 1;
+        assert_eq!(win.lines[0].get(0).to_string().chars().count(), 1 + held);
+        assert_eq!(cells(&win, 0), ['a', 'b', ' ']);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_ins_wch_inserts_a_double_width_character_once() {
+        let mut win = Window::new(1, 6, 0, 0).unwrap();
+        win.addstr("abc").unwrap();
+        win.mv(0, 0).unwrap();
+        win.ins_wch(&CCharT::from_char('日')).unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', 'a', 'b', 'c', ' ']);
+        assert_eq!(win.getcurx(), 0);
+
+        win.mv(0, 2).unwrap();
+        win.ins_wch(&CCharT::from_char('x')).unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', 'x', 'a', 'b', 'c']);
+
+        // No room for both cells in the last column: nothing is inserted.
+        win.mv(0, 5).unwrap();
+        win.ins_wch(&CCharT::from_char('本')).unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', 'x', 'a', 'b', 'c']);
+        win.mv(0, 4).unwrap();
+        win.ins_wch(&CCharT::from_char('本')).unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', 'x', 'a', '本', '\0']);
+    }
+
+    #[test]
+    fn test_tab_moves_to_the_next_tab_stop() {
+        let mut win = Window::new(2, 20, 0, 0).unwrap();
+        win.mvaddstr(0, 3, "\tx").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (0, 9));
+        win.mvaddstr(1, 8, "\ty").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 17));
+        assert_eq!(
+            rows_of(&mut win, 20),
+            ["        x           ", "                y   "]
+        );
+    }
+
+    #[test]
+    fn test_tab_past_the_right_edge_goes_to_the_start_of_the_next_line() {
+        for column in [8, 9] {
+            let mut win = Window::new(2, 10, 0, 0).unwrap();
+            win.mvaddstr(0, 0, "0123456789").unwrap();
+            win.mvaddstr(0, column, "\tx").unwrap();
+            assert_eq!(
+                (win.getcury(), win.getcurx()),
+                (1, 1),
+                "from column {column}"
+            );
+            let kept = &"0123456789"[..column as usize];
+            assert_eq!(
+                rows_of(&mut win, 10),
+                [format!("{kept:<10}"), "x         ".to_string()]
+            );
+        }
+
+        // The last tab stop inside the window is still reached.
+        let mut win = Window::new(2, 10, 0, 0).unwrap();
+        win.mvaddstr(0, 5, "\tx").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (0, 9));
+        assert_eq!(rows_of(&mut win, 10), ["        x ", "          "]);
+    }
+
+    #[test]
+    fn test_tab_past_the_right_edge_of_the_last_line() {
+        // Nowhere to go without scrolling: the cursor stops at the edge.
+        let mut win = Window::new(2, 10, 0, 0).unwrap();
+        win.mvaddstr(1, 8, "ab").unwrap();
+        win.mvaddstr(1, 8, "\t").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 9));
+        assert_eq!(rows_of(&mut win, 10)[1], "          ");
+
+        // With scrolling the window scrolls.
+        let mut win = Window::new(2, 10, 0, 0).unwrap();
+        win.scrollok(true);
+        win.mvaddstr(0, 0, "top").unwrap();
+        win.mvaddstr(1, 0, "bottom").unwrap();
+        win.mvaddstr(1, 8, "\tx").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 1));
+        assert_eq!(rows_of(&mut win, 10), ["bottom    ", "x         "]);
+    }
+
+    #[test]
+    fn test_newline_on_the_last_line_of_the_scroll_region_scrolls_it() {
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(2, 2).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        // The rest of the line is cleared, the region scrolls, and the
+        // cursor stays on the region's last line.
+        assert_eq!(rows(&mut win), ["aaa", "cc ", "   ", "ddd", "eee"]);
+
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(2, 2).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (2, 0));
+    }
+
+    #[test]
+    fn test_wrapping_on_the_last_line_of_the_scroll_region_scrolls_it() {
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(2, 2).unwrap();
+        win.addstr("XY").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (2, 1));
+        assert_eq!(rows(&mut win), ["aaa", "ccX", "Y  ", "ddd", "eee"]);
+    }
+
+    #[test]
+    fn test_newline_outside_the_scroll_region_moves_down_without_scrolling() {
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+
+        // Above the region.
+        win.mv(0, 3 - 1).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 0));
+
+        // Below it: down to the last line of the window. From there the
+        // cursor goes back to the start of that line.
+        win.mv(3, 2).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (4, 0));
+        win.mv(4, 2).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (4, 0));
+        assert_eq!(rows(&mut win), ["aa ", "bbb", "ccc", "dd ", "ee "]);
+    }
+
+    #[test]
+    fn test_wrapping_on_the_last_line_below_the_scroll_region_stays_on_it() {
+        // With or without scrolling: the region is not involved.
+        for scrolling in [true, false] {
+            let mut win = five_lines(0);
+            win.scrollok(scrolling);
+            win.setscrreg(1, 2).unwrap();
+            win.mv(4, 2).unwrap();
+            win.addstr("XY").unwrap();
+            assert_eq!((win.getcury(), win.getcurx()), (4, 1));
+            assert_eq!(rows(&mut win), ["aaa", "bbb", "ccc", "ddd", "YeX"]);
+        }
+
+        // One line higher the text runs on to the last line.
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(3, 2).unwrap();
+        win.addstr("XY").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (4, 1));
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "ccc", "ddX", "Yee"]);
+    }
+
+    #[test]
+    fn test_newline_at_the_scroll_region_bottom_without_scrollok_stays_put() {
+        let mut win = five_lines(0);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(2, 1).unwrap();
+        win.addch('\n' as ChType).unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (2, 1));
+        win.mv(2, 2).unwrap();
+        win.addstr("XY").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (2, 2));
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "c Y", "ddd", "eee"]);
+    }
+
+    #[test]
+    fn test_newline_scrolls_a_window_with_the_default_scroll_region() {
+        let mut win = Window::new(2, 3, 0, 0).unwrap();
+        win.scrollok(true);
+        win.addstr("ab\ncd\nef").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 2));
+        assert_eq!(rows(&mut win), ["cd ", "ef "]);
     }
 
     #[test]

@@ -156,6 +156,16 @@ pub enum InputWait {
 /// as `TimedOut`, so a bad descriptor cannot turn a blocking read into a
 /// busy loop.
 pub(crate) fn poll_readable(fd: RawFd, timeout: Option<Duration>) -> InputWait {
+    poll_fd(fd, libc::POLLIN, timeout)
+}
+
+/// Wait until `fd` can be written to without blocking, or a signal arrives.
+fn poll_writable(fd: RawFd) -> InputWait {
+    poll_fd(fd, libc::POLLOUT, None)
+}
+
+/// Wait for `events` on `fd`: see [`poll_readable`].
+fn poll_fd(fd: RawFd, events: libc::c_short, timeout: Option<Duration>) -> InputWait {
     let timeout_ms: libc::c_int = match timeout {
         None => -1,
         Some(t) => t.as_micros().div_ceil(1000).min(libc::c_int::MAX as u128) as libc::c_int,
@@ -163,7 +173,7 @@ pub(crate) fn poll_readable(fd: RawFd, timeout: Option<Duration>) -> InputWait {
 
     let mut pollfd = libc::pollfd {
         fd,
-        events: libc::POLLIN,
+        events,
         revents: 0,
     };
 
@@ -172,7 +182,7 @@ pub(crate) fn poll_readable(fd: RawFd, timeout: Option<Duration>) -> InputWait {
     let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
 
     if result > 0 {
-        // Readable, or hung up / errored: either way a read will not block
+        // Ready, or hung up / errored: either way the call will not block
         InputWait::Ready
     } else if result == 0 {
         InputWait::TimedOut
@@ -730,10 +740,6 @@ impl Terminal {
 
     /// Enter program mode (raw/cbreak).
     pub fn enter_program_mode(&mut self) -> Result<()> {
-        // Save current as program settings
-        self.prog_settings.termios = self.current;
-        self.prog_settings.saved = !self.no_tty;
-
         if !self.no_tty {
             // Set up raw-ish mode
             let mut new_settings = self.current;
@@ -765,6 +771,11 @@ impl Terminal {
 
             self.current = new_settings;
         }
+
+        // What is in force now is the program mode: `restore_prog_mode`
+        // comes back to this, until `save_prog_mode` records something else.
+        self.prog_settings.termios = self.current;
+        self.prog_settings.saved = !self.no_tty;
 
         self.state = TermState::Running;
 
@@ -910,33 +921,47 @@ impl Terminal {
     }
 
     /// Flush the output buffer to the terminal.
+    ///
+    /// Everything in the buffer is written before this returns: a write
+    /// that takes only part of it, is interrupted by a signal, or finds a
+    /// non-blocking descriptor full is carried on with. On any other error
+    /// the rest of the buffer is discarded.
     pub fn flush(&mut self) -> Result<()> {
-        if self.output_buffer.is_empty() {
-            return Ok(());
-        }
+        let mut written = 0;
+        let result = loop {
+            let rest = &self.output_buffer[written..];
+            if rest.is_empty() {
+                break Ok(());
+            }
 
-        // SAFETY: `libc::write` writes data to a file descriptor.
-        // - `self.output_fd` is a valid file descriptor (validated in `new()`)
-        // - `self.output_buffer.as_ptr()` returns a valid pointer to the buffer's data
-        // - `self.output_buffer.len()` is the exact number of bytes to write
-        // - The buffer remains valid and unchanged during the write call
-        let result = unsafe {
-            libc::write(
-                self.output_fd,
-                self.output_buffer.as_ptr() as *const libc::c_void,
-                self.output_buffer.len(),
-            )
+            // SAFETY: `libc::write` writes data to a file descriptor.
+            // - `self.output_fd` is a valid file descriptor (validated in `new()`)
+            // - `rest.as_ptr()` points to `rest.len()` initialised bytes
+            // - The buffer remains valid and unchanged during the write call
+            let result = unsafe {
+                libc::write(
+                    self.output_fd,
+                    rest.as_ptr() as *const libc::c_void,
+                    rest.len(),
+                )
+            };
+
+            match usize::try_from(result) {
+                // Nothing was taken and no error given: stop instead of spinning
+                Ok(0) => break Err(Error::SystemError(libc::EIO)),
+                Ok(n) => written += n,
+                Err(_) => match io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    Some(libc::EAGAIN) => {
+                        poll_writable(self.output_fd);
+                    }
+                    errno => break Err(Error::SystemError(errno.unwrap_or(-1))),
+                },
+            }
         };
 
         self.output_buffer.clear();
-
-        if result < 0 {
-            Err(Error::SystemError(
-                io::Error::last_os_error().raw_os_error().unwrap_or(-1),
-            ))
-        } else {
-            Ok(())
-        }
+        result
     }
 
     /// Read a single byte from the terminal.
@@ -1030,7 +1055,9 @@ impl Terminal {
         if attr & A_BLINK != 0 {
             codes.push(5);
         }
-        if attr & A_REVERSE != 0 {
+        // Standout is shown as reverse video, as terminfo's `smso` does on
+        // the terminals this drives.
+        if attr & (A_REVERSE | A_STANDOUT) != 0 {
             codes.push(7);
         }
         if attr & A_INVIS != 0 {
@@ -1047,7 +1074,12 @@ impl Terminal {
     }
 
     /// Set foreground color.
-    pub fn set_fg_color(&mut self, color: i16) -> Result<()> {
+    ///
+    /// A negative number is the terminal's default color. Colors up to 255
+    /// are palette colors. A larger number is a direct color, `0xRRGGBB`,
+    /// as on a terminal with millions of colors.
+    pub fn set_fg_color(&mut self, color: impl Into<i32>) -> Result<()> {
+        let color = color.into();
         if color < 0 {
             // Default color
             self.write_escape("\x1b[39m")
@@ -1057,14 +1089,22 @@ impl Terminal {
         } else if color < 16 {
             let seq = format!("\x1b[{}m", 90 + color - 8);
             self.write_str(&seq)
-        } else {
+        } else if color < 256 {
             let seq = format!("\x1b[38;5;{}m", color);
+            self.write_str(&seq)
+        } else {
+            let [_, red, green, blue] = color.to_be_bytes();
+            let seq = format!("\x1b[38;2;{red};{green};{blue}m");
             self.write_str(&seq)
         }
     }
 
     /// Set background color.
-    pub fn set_bg_color(&mut self, color: i16) -> Result<()> {
+    ///
+    /// The color numbers mean what they do for
+    /// [`set_fg_color`](Self::set_fg_color).
+    pub fn set_bg_color(&mut self, color: impl Into<i32>) -> Result<()> {
+        let color = color.into();
         if color < 0 {
             // Default color
             self.write_escape("\x1b[49m")
@@ -1074,8 +1114,12 @@ impl Terminal {
         } else if color < 16 {
             let seq = format!("\x1b[{}m", 100 + color - 8);
             self.write_str(&seq)
-        } else {
+        } else if color < 256 {
             let seq = format!("\x1b[48;5;{}m", color);
+            self.write_str(&seq)
+        } else {
+            let [_, red, green, blue] = color.to_be_bytes();
+            let seq = format!("\x1b[48;2;{red};{green};{blue}m");
             self.write_str(&seq)
         }
     }
@@ -1225,6 +1269,10 @@ impl Terminal {
     ///
     /// When enabled, if an interrupt key is pressed, any pending input will be flushed.
     pub fn intrflush(&mut self, enable: bool) -> Result<()> {
+        if self.no_tty {
+            return Ok(());
+        }
+
         let mut new_settings = self.current;
 
         if enable {
@@ -1254,6 +1302,10 @@ impl Terminal {
     /// When enabled, the terminal passes 8-bit characters through without
     /// stripping the high bit.
     pub fn meta(&mut self, enable: bool) -> Result<()> {
+        if self.no_tty {
+            return Ok(());
+        }
+
         let mut new_settings = self.current;
 
         if enable {
@@ -1298,6 +1350,10 @@ impl Terminal {
     /// When enabled (the default), pressing interrupt/quit/suspend keys
     /// will flush the queues. When disabled, queues are not flushed.
     pub fn qiflush(&mut self, enable: bool) -> Result<()> {
+        if self.no_tty {
+            return Ok(());
+        }
+
         let mut new_settings = self.current;
 
         if enable {
@@ -1375,53 +1431,52 @@ pub fn baudrate() -> i32 {
     // The termios struct was successfully initialized by `tcgetattr` above.
     let ospeed = unsafe { libc::cfgetospeed(&termios) };
 
-    // Convert speed_t constant to actual baud rate
-    // The values and their meanings vary by platform, but these are common
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        // On Linux, the speed constants are the actual baud rates
-        ospeed as i32
-    }
+    speed_to_baud(ospeed)
+}
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        // On macOS/BSD, the speed constants are the actual baud rates
-        ospeed as i32
-    }
-
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios"
-    )))]
-    {
-        // Fallback for other platforms - map common speed constants
-        match ospeed {
-            libc::B0 => 0,
-            libc::B50 => 50,
-            libc::B75 => 75,
-            libc::B110 => 110,
-            libc::B134 => 134,
-            libc::B150 => 150,
-            libc::B200 => 200,
-            libc::B300 => 300,
-            libc::B600 => 600,
-            libc::B1200 => 1200,
-            libc::B1800 => 1800,
-            libc::B2400 => 2400,
-            libc::B4800 => 4800,
-            libc::B9600 => 9600,
-            libc::B19200 => 19200,
-            libc::B38400 => 38400,
-            #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
-            libc::B57600 => 57600,
-            #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
-            libc::B115200 => 115200,
-            #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
-            libc::B230400 => 230400,
-            _ => ospeed as i32,
-        }
+/// The baud rate a `speed_t` value from `cfgetospeed` stands for.
+///
+/// On Linux a `speed_t` is a code, not a rate: `B38400` is 15. On macOS and
+/// the BSDs the two happen to be equal. Matching on the constants gives the
+/// rate either way. A value that is none of them is returned as it is.
+fn speed_to_baud(speed: libc::speed_t) -> i32 {
+    match speed {
+        libc::B0 => 0,
+        libc::B50 => 50,
+        libc::B75 => 75,
+        libc::B110 => 110,
+        libc::B134 => 134,
+        libc::B150 => 150,
+        libc::B200 => 200,
+        libc::B300 => 300,
+        libc::B600 => 600,
+        libc::B1200 => 1200,
+        libc::B1800 => 1800,
+        libc::B2400 => 2400,
+        libc::B4800 => 4800,
+        libc::B9600 => 9600,
+        libc::B19200 => 19200,
+        libc::B38400 => 38400,
+        libc::B57600 => 57600,
+        libc::B115200 => 115200,
+        libc::B230400 => 230400,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::B460800 => 460800,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::B500000 => 500000,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::B576000 => 576000,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::B921600 => 921600,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::B1000000 => 1000000,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::B1152000 => 1152000,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::B1500000 => 1500000,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::B2000000 => 2000000,
+        other => other as i32,
     }
 }
 
@@ -1448,6 +1503,294 @@ mod tests {
     #[test]
     fn test_term_state() {
         assert_eq!(TermState::default(), TermState::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// A terminal writing to a pipe, and the pipe's read end.
+    fn terminal_on_a_pipe() -> (Terminal, std::fs::File, OwnedFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a valid two-element array for pipe() to fill
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors were just created and are owned by
+        // nothing else.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let terminal = Terminal::new(write.as_raw_fd(), write.as_raw_fd()).unwrap();
+        assert!(terminal.is_no_tty());
+        (terminal, std::fs::File::from(read), write)
+    }
+
+    fn set_nonblocking(fd: RawFd) {
+        // SAFETY: `fd` is an open descriptor; F_GETFL and F_SETFL only read
+        // and change its status flags.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert!(flags >= 0);
+            assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+        }
+    }
+
+    /// Bytes that show up any loss or reordering.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn colors_are_sent_in_the_form_their_number_calls_for() {
+        let (mut terminal, mut output, write) = terminal_on_a_pipe();
+        for color in [-1, 0, 7, 8, 15, 16, 255, 256, 0x12_34_56, 0xFF_FF_FF] {
+            terminal.set_fg_color(color).unwrap();
+            terminal.set_bg_color(color).unwrap();
+            terminal.write(b"|").unwrap();
+        }
+        // A `ColorT` is accepted as it is.
+        terminal.set_fg_color(3_i16).unwrap();
+        terminal.flush().unwrap();
+        drop((terminal, write));
+
+        let mut written = String::new();
+        output.read_to_string(&mut written).unwrap();
+        let sent: Vec<&str> = written.split('|').collect();
+        assert_eq!(
+            sent,
+            [
+                "\x1b[39m\x1b[49m",
+                "\x1b[30m\x1b[40m",
+                "\x1b[37m\x1b[47m",
+                "\x1b[90m\x1b[100m",
+                "\x1b[97m\x1b[107m",
+                "\x1b[38;5;16m\x1b[48;5;16m",
+                "\x1b[38;5;255m\x1b[48;5;255m",
+                "\x1b[38;2;0;1;0m\x1b[48;2;0;1;0m",
+                "\x1b[38;2;18;52;86m\x1b[48;2;18;52;86m",
+                "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m",
+                "\x1b[33m",
+            ]
+        );
+    }
+
+    #[test]
+    fn flush_writes_the_buffer() {
+        let (mut terminal, mut output, write) = terminal_on_a_pipe();
+        terminal.write(b"hello ").unwrap();
+        terminal.write_str("world").unwrap();
+        terminal.flush().unwrap();
+        // Flushing again writes nothing more.
+        terminal.flush().unwrap();
+        drop((terminal, write));
+
+        let mut written = String::new();
+        output.read_to_string(&mut written).unwrap();
+        assert_eq!(written, "hello world");
+    }
+
+    #[test]
+    fn flush_writes_everything_when_the_descriptor_takes_it_in_pieces() {
+        // More than a pipe holds (up to 1 MiB where pages are 64 KiB), on a
+        // descriptor that will not block: the first write takes part of it
+        // and the next finds the pipe full.
+        let data = pattern(3_000_000);
+        let (mut terminal, mut output, write) = terminal_on_a_pipe();
+        set_nonblocking(write.as_raw_fd());
+
+        let expected = data.len();
+        let reader = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while received.len() < expected {
+                // Read slowly at first, so the writer meets a full pipe.
+                if received.len() < 3 * chunk.len() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                match output.read(&mut chunk).unwrap() {
+                    0 => break,
+                    n => received.extend_from_slice(&chunk[..n]),
+                }
+            }
+            received
+        });
+
+        terminal.write(&data).unwrap();
+        terminal.flush().unwrap();
+        drop((terminal, write));
+
+        let received = reader.join().unwrap();
+        assert_eq!(received.len(), data.len());
+        assert!(
+            received == data,
+            "the bytes arrived changed or out of order"
+        );
+    }
+
+    #[test]
+    fn flush_reports_an_error_and_drops_the_buffer() {
+        let (mut terminal, output, write) = terminal_on_a_pipe();
+        // Nobody will ever read: writing fails with EPIPE. Rust ignores
+        // SIGPIPE, so the write returns the error.
+        drop(output);
+        terminal.write(b"lost").unwrap();
+        assert!(matches!(
+            terminal.flush(),
+            Err(Error::SystemError(libc::EPIPE))
+        ));
+        // The failed output is not sent again later.
+        terminal.flush().unwrap();
+        drop((terminal, write));
+    }
+}
+
+/// Tests against a pseudo-terminal, where terminal modes really apply.
+#[cfg(test)]
+pub(crate) mod tty_tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// A pseudo-terminal: the side a program sees, and the side driving it.
+    pub(crate) struct Pty {
+        pub(crate) terminal_side: OwnedFd,
+        _driver_side: OwnedFd,
+    }
+
+    pub(crate) fn open_pty() -> Pty {
+        let (mut driver, mut terminal) = (0 as RawFd, 0 as RawFd);
+        // SAFETY: `openpty` fills the two descriptors; the name, termios
+        // and window size arguments may be null.
+        let result = unsafe {
+            libc::openpty(
+                &mut driver,
+                &mut terminal,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, 0, "openpty: {}", io::Error::last_os_error());
+        // SAFETY: both descriptors were just created and are owned by
+        // nothing else.
+        unsafe {
+            Pty {
+                terminal_side: OwnedFd::from_raw_fd(terminal),
+                _driver_side: OwnedFd::from_raw_fd(driver),
+            }
+        }
+    }
+
+    /// The local-mode flags the terminal has right now.
+    pub(crate) fn local_flags(fd: RawFd) -> libc::tcflag_t {
+        // SAFETY: a zeroed termios is a valid value for tcgetattr to fill.
+        let mut termios = unsafe { MaybeUninit::<libc::termios>::zeroed().assume_init() };
+        // SAFETY: `fd` is an open terminal and `termios` a valid struct.
+        assert_eq!(unsafe { libc::tcgetattr(fd, &mut termios) }, 0);
+        termios.c_lflag
+    }
+
+    #[test]
+    fn a_pseudo_terminal_is_a_real_terminal() {
+        let pty = open_pty();
+        let terminal = Terminal::new(pty.terminal_side.as_raw_fd(), pty.terminal_side.as_raw_fd());
+        assert!(!terminal.unwrap().is_no_tty());
+    }
+
+    #[test]
+    fn restore_prog_mode_comes_back_to_the_mode_entered() {
+        let pty = open_pty();
+        let fd = pty.terminal_side.as_raw_fd();
+        let mut terminal = Terminal::new(fd, fd).unwrap();
+        // A terminal starts out cooked and echoing.
+        assert_ne!(local_flags(fd) & libc::ICANON, 0);
+        assert_ne!(local_flags(fd) & libc::ECHO, 0);
+
+        terminal.enter_program_mode().unwrap();
+        assert_eq!(local_flags(fd) & (libc::ICANON | libc::ECHO), 0);
+
+        // Out to the shell and back.
+        terminal.restore_shell_mode().unwrap();
+        assert_ne!(local_flags(fd) & libc::ICANON, 0);
+        terminal.restore_prog_mode().unwrap();
+        assert_eq!(local_flags(fd) & (libc::ICANON | libc::ECHO), 0);
+    }
+
+    #[test]
+    fn save_prog_mode_records_the_mode_in_force() {
+        let pty = open_pty();
+        let fd = pty.terminal_side.as_raw_fd();
+        let mut terminal = Terminal::new(fd, fd).unwrap();
+        terminal.enter_program_mode().unwrap();
+        terminal.echo(true).unwrap();
+        terminal.save_prog_mode().unwrap();
+
+        terminal.echo(false).unwrap();
+        assert_eq!(local_flags(fd) & libc::ECHO, 0);
+        terminal.restore_prog_mode().unwrap();
+        assert_ne!(local_flags(fd) & libc::ECHO, 0);
+        assert_eq!(local_flags(fd) & libc::ICANON, 0);
+    }
+
+    #[test]
+    fn flush_settings_apply_on_a_terminal() {
+        let pty = open_pty();
+        let fd = pty.terminal_side.as_raw_fd();
+        let mut terminal = Terminal::new(fd, fd).unwrap();
+        terminal.qiflush(false).unwrap();
+        assert_ne!(local_flags(fd) & libc::NOFLSH, 0);
+        terminal.qiflush(true).unwrap();
+        assert_eq!(local_flags(fd) & libc::NOFLSH, 0);
+        terminal.intrflush(false).unwrap();
+        assert_ne!(local_flags(fd) & libc::NOFLSH, 0);
+        terminal.intrflush(true).unwrap();
+        assert_eq!(local_flags(fd) & libc::NOFLSH, 0);
+        terminal.meta(true).unwrap();
+        terminal.meta(false).unwrap();
+    }
+
+    #[test]
+    fn mode_setters_do_nothing_without_a_terminal() {
+        let (read, _write) = std::io::pipe().unwrap();
+        let mut terminal = Terminal::new(read.as_raw_fd(), read.as_raw_fd()).unwrap();
+        assert!(terminal.is_no_tty());
+        for enable in [true, false] {
+            terminal.intrflush(enable).unwrap();
+            terminal.meta(enable).unwrap();
+            terminal.qiflush(enable).unwrap();
+            terminal.raw(enable).unwrap();
+            terminal.cbreak(enable).unwrap();
+            terminal.echo(enable).unwrap();
+        }
+        terminal.save_prog_mode().unwrap();
+        terminal.restore_prog_mode().unwrap();
+    }
+
+    #[test]
+    fn speed_codes_are_turned_into_baud_rates() {
+        for (speed, baud) in [
+            (libc::B0, 0),
+            (libc::B300, 300),
+            (libc::B9600, 9600),
+            (libc::B38400, 38400),
+            (libc::B115200, 115_200),
+            (libc::B230400, 230_400),
+        ] {
+            assert_eq!(speed_to_baud(speed), baud);
+        }
+
+        // A pseudo-terminal reports a real rate, not a speed code.
+        let pty = open_pty();
+        // SAFETY: a zeroed termios is a valid value for tcgetattr to fill.
+        let mut termios = unsafe { MaybeUninit::<libc::termios>::zeroed().assume_init() };
+        // SAFETY: the descriptor is an open terminal.
+        assert_eq!(
+            unsafe { libc::tcgetattr(pty.terminal_side.as_raw_fd(), &mut termios) },
+            0
+        );
+        // SAFETY: `termios` was filled in by tcgetattr.
+        let baud = speed_to_baud(unsafe { libc::cfgetospeed(&termios) });
+        assert!(baud == 0 || baud >= 50, "{baud}");
+        assert!(baud != 15, "a Linux speed code came back as the rate");
     }
 }
 

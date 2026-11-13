@@ -6,6 +6,11 @@
 
 use crate::error::{Error, Result};
 use crate::types::ColorT;
+use std::collections::BTreeMap;
+
+/// How many colors have a slot of their own in a color manager's table.
+/// Colors beyond these are kept only once they are defined.
+const PALETTE_SIZE: i32 = 256;
 
 // ============================================================================
 // Standard Colors
@@ -137,10 +142,11 @@ impl ColorDef {
 /// Color pair definition (foreground and background).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ColorPair {
-    /// Foreground color index.
-    pub foreground: ColorT,
+    /// Foreground color index. Wider than `ColorT`, so that a pair can
+    /// hold the color numbers of a terminal with more than 32767 colors.
+    pub foreground: i32,
     /// Background color index.
-    pub background: ColorT,
+    pub background: i32,
     /// Whether this pair has been initialized.
     pub initialized: bool,
 }
@@ -148,6 +154,11 @@ pub struct ColorPair {
 impl ColorPair {
     /// Create a new color pair.
     pub const fn new(foreground: ColorT, background: ColorT) -> Self {
+        Self::new_extended(foreground as i32, background as i32)
+    }
+
+    /// Create a new color pair from color numbers of any size.
+    pub const fn new_extended(foreground: i32, background: i32) -> Self {
         Self {
             foreground,
             background,
@@ -158,8 +169,8 @@ impl ColorPair {
     /// Create an uninitialized (default) color pair.
     pub const fn default_pair() -> Self {
         Self {
-            foreground: COLOR_WHITE,
-            background: COLOR_BLACK,
+            foreground: COLOR_WHITE as i32,
+            background: COLOR_BLACK as i32,
             initialized: false,
         }
     }
@@ -179,8 +190,12 @@ pub struct ColorManager {
     num_colors: i32,
     /// Number of available color pairs.
     num_pairs: i32,
-    /// Color definitions.
+    /// Color definitions of the palette: the first `PALETTE_SIZE` colors,
+    /// or all of them when the terminal has fewer.
     colors: Vec<ColorDef>,
+    /// Definitions given to colors beyond the palette. A terminal with
+    /// direct color has millions of them, almost all never defined.
+    more_colors: BTreeMap<i32, ColorDef>,
     /// Color pairs.
     pairs: Vec<ColorPair>,
     /// Whether to use default colors (-1 for default).
@@ -190,8 +205,9 @@ pub struct ColorManager {
 impl ColorManager {
     /// Create a new color manager.
     pub fn new(num_colors: i32, num_pairs: i32, can_change: bool) -> Self {
-        let mut colors = vec![ColorDef::default_color(); num_colors as usize];
-        let pairs = vec![ColorPair::default_pair(); num_pairs as usize];
+        let palette = num_colors.clamp(0, PALETTE_SIZE) as usize;
+        let mut colors = vec![ColorDef::default_color(); palette];
+        let pairs = vec![ColorPair::default_pair(); num_pairs.max(0) as usize];
 
         // Initialize standard colors with typical values
         if num_colors >= 8 {
@@ -211,9 +227,42 @@ impl ColorManager {
             num_colors,
             num_pairs,
             colors,
+            more_colors: BTreeMap::new(),
             pairs,
             use_default_colors: false,
         }
+    }
+
+    /// The definition of `color`, which must be a valid color number.
+    fn color_def(&self, color: i32) -> ColorDef {
+        match self.colors.get(color as usize) {
+            Some(def) => *def,
+            None => self
+                .more_colors
+                .get(&color)
+                .copied()
+                .unwrap_or_else(ColorDef::default_color),
+        }
+    }
+
+    /// Define `color`, which must be a valid color number.
+    fn set_color_def(&mut self, color: i32, def: ColorDef) {
+        match self.colors.get_mut(color as usize) {
+            Some(slot) => *slot = def,
+            None => {
+                self.more_colors.insert(color, def);
+            }
+        }
+    }
+
+    /// The foreground and background of `pair` as the terminal is to show
+    /// them, or `None` when there is no such pair or color is not started.
+    pub(crate) fn pair_colors(&self, pair: i32) -> Option<(i32, i32)> {
+        if !self.started {
+            return None;
+        }
+        let pair = self.pairs.get(usize::try_from(pair).ok()?)?;
+        Some((pair.foreground, pair.background))
     }
 
     /// Start color mode.
@@ -295,8 +344,11 @@ impl ColorManager {
             return Err(Error::InvalidColorPair(pair));
         }
 
+        // A color number too large for a `ColorT` is reported as the largest
+        // one; `extended_pair_content` returns it in full.
+        let limit = |color: i32| color.min(i32::from(ColorT::MAX)) as ColorT;
         let cp = &self.pairs[pair as usize];
-        Ok((cp.foreground, cp.background))
+        Ok((limit(cp.foreground), limit(cp.background)))
     }
 
     /// Initialize a color with RGB values.
@@ -315,7 +367,7 @@ impl ColorManager {
             return Err(Error::InvalidArgument("RGB values must be 0-1000".into()));
         }
 
-        self.colors[color as usize] = ColorDef::new(r, g, b);
+        self.set_color_def(i32::from(color), ColorDef::new(r, g, b));
         Ok(())
     }
 
@@ -328,7 +380,7 @@ impl ColorManager {
             return Err(Error::InvalidColor(color));
         }
 
-        let def = &self.colors[color as usize];
+        let def = self.color_def(i32::from(color));
         Ok((def.red, def.green, def.blue))
     }
 
@@ -384,7 +436,7 @@ impl ColorManager {
             return Err(Error::InvalidColor(bg as i16));
         }
 
-        self.pairs[pair as usize] = ColorPair::new(fg as ColorT, bg as ColorT);
+        self.pairs[pair as usize] = ColorPair::new_extended(fg, bg);
         Ok(())
     }
 
@@ -402,7 +454,7 @@ impl ColorManager {
         }
 
         let cp = &self.pairs[pair as usize];
-        Ok((cp.foreground as i32, cp.background as i32))
+        Ok((cp.foreground, cp.background))
     }
 
     /// Initialize an extended color with RGB values.
@@ -426,7 +478,7 @@ impl ColorManager {
             return Err(Error::InvalidArgument("RGB values must be 0-1000".into()));
         }
 
-        self.colors[color as usize] = ColorDef::new(r as i16, g as i16, b as i16);
+        self.set_color_def(color, ColorDef::new(r as i16, g as i16, b as i16));
         Ok(())
     }
 
@@ -440,7 +492,7 @@ impl ColorManager {
             return Err(Error::InvalidColor(color as i16));
         }
 
-        let def = &self.colors[color as usize];
+        let def = self.color_def(color);
         Ok((def.red as i32, def.green as i32, def.blue as i32))
     }
 
@@ -477,10 +529,7 @@ impl ColorManager {
         }
 
         for (i, pair) in self.pairs.iter().enumerate() {
-            if pair.initialized
-                && pair.foreground == fg as ColorT
-                && pair.background == bg as ColorT
-            {
+            if pair.initialized && pair.foreground == fg && pair.background == bg {
                 return Ok(i as i32);
             }
         }
@@ -512,6 +561,103 @@ impl Default for ColorManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A started color manager for a terminal with direct color.
+    fn direct_color_manager() -> ColorManager {
+        let mut colors = ColorManager::new(1 << 24, 32767, true);
+        colors.start().unwrap();
+        colors
+    }
+
+    #[test]
+    fn test_color_table_stays_small_on_a_direct_color_terminal() {
+        let colors = direct_color_manager();
+        assert_eq!(colors.num_colors(), 1 << 24);
+        assert_eq!(colors.colors.len(), PALETTE_SIZE as usize);
+        assert!(colors.more_colors.is_empty());
+
+        // A terminal with fewer colors than the palette holds gets a slot
+        // for each, and one with none gets none.
+        assert_eq!(ColorManager::new(8, 64, false).colors.len(), 8);
+        assert_eq!(ColorManager::new(0, 0, false).colors.len(), 0);
+        assert_eq!(ColorManager::new(-1, -1, false).colors.len(), 0);
+    }
+
+    #[test]
+    fn test_colors_beyond_the_palette_can_be_defined_and_read() {
+        let mut colors = direct_color_manager();
+        // Not defined yet.
+        assert_eq!(colors.color_content(300).unwrap(), (0, 0, 0));
+
+        colors.init_color(300, 1000, 500, 0).unwrap();
+        assert_eq!(colors.color_content(300).unwrap(), (1000, 500, 0));
+        // The standard colors are untouched.
+        assert_eq!(colors.color_content(1).unwrap(), (680, 0, 0));
+        colors.init_color(1, 1, 2, 3).unwrap();
+        assert_eq!(colors.color_content(1).unwrap(), (1, 2, 3));
+        assert_eq!(colors.more_colors.len(), 1);
+    }
+
+    #[cfg(feature = "ext-colors")]
+    #[test]
+    fn test_extended_colors_beyond_the_palette() {
+        let mut colors = direct_color_manager();
+        colors.init_extended_color(1_000_000, 10, 20, 30).unwrap();
+        assert_eq!(
+            colors.extended_color_content(1_000_000).unwrap(),
+            (10, 20, 30)
+        );
+        assert_eq!(colors.extended_color_content(1_000_001).unwrap(), (0, 0, 0));
+        assert!(colors.init_extended_color(1 << 24, 0, 0, 0).is_err());
+        assert!(colors.extended_color_content(1 << 24).is_err());
+    }
+
+    #[cfg(feature = "ext-colors")]
+    #[test]
+    fn test_extended_pair_keeps_large_color_numbers() {
+        let mut colors = direct_color_manager();
+        colors.init_extended_pair(1, 70_000, 0x12_34_56).unwrap();
+        assert_eq!(
+            colors.extended_pair_content(1).unwrap(),
+            (70_000, 0x12_34_56)
+        );
+        assert_eq!(colors.pair_colors(1), Some((70_000, 0x12_34_56)));
+        // The narrower call cannot say more than its type holds.
+        assert_eq!(colors.pair_content(1).unwrap(), (i16::MAX, i16::MAX));
+
+        assert_eq!(colors.find_pair(70_000, 0x12_34_56).unwrap(), 1);
+        // 70000 cut down to 16 bits is 4464: not the same pair.
+        assert!(colors.find_pair(4464, 0x12_34_56).is_err());
+        assert_eq!(colors.alloc_pair(16_000_000, 1).unwrap(), 2);
+        assert_eq!(colors.extended_pair_content(2).unwrap(), (16_000_000, 1));
+    }
+
+    #[cfg(feature = "ext-colors")]
+    #[test]
+    fn test_extended_pair_rejects_colors_the_terminal_does_not_have() {
+        let mut colors = ColorManager::new(256, 32767, false);
+        colors.start().unwrap();
+        assert!(colors.init_extended_pair(1, 70_000, 0).is_err());
+        assert!(colors.init_extended_pair(1, 0, 256).is_err());
+        colors.init_extended_pair(1, 255, 0).unwrap();
+        assert_eq!(colors.extended_pair_content(1).unwrap(), (255, 0));
+        assert_eq!(colors.pair_content(1).unwrap(), (255, 0));
+    }
+
+    #[test]
+    fn test_pair_colors_for_the_terminal() {
+        let mut colors = ColorManager::new(8, 64, false);
+        // Nothing before color is started.
+        assert_eq!(colors.pair_colors(1), None);
+        colors.start().unwrap();
+        colors.init_pair(1, COLOR_RED, COLOR_BLUE).unwrap();
+        assert_eq!(
+            colors.pair_colors(1),
+            Some((i32::from(COLOR_RED), i32::from(COLOR_BLUE)))
+        );
+        assert_eq!(colors.pair_colors(64), None);
+        assert_eq!(colors.pair_colors(-1), None);
+    }
 
     #[test]
     fn test_color_enum() {
