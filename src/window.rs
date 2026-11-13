@@ -813,6 +813,9 @@ impl Window {
             b'\t' => {
                 // Tab: move to next tab stop (every 8 columns)
                 let next_tab = ((self.curx / 8) + 1) * 8;
+                if next_tab > self.maxx {
+                    return self.tab_past_the_right_edge();
+                }
                 let spaces = (next_tab - self.curx) as usize;
                 for _ in 0..spaces {
                     self.add_ch_internal(b' ' as ChType | (ch & !A_CHARTEXT))?;
@@ -867,6 +870,9 @@ impl Window {
             }
             '\t' => {
                 let next_tab = ((self.curx / 8) + 1) * 8;
+                if next_tab > self.maxx {
+                    return self.tab_past_the_right_edge();
+                }
                 let spaces = (next_tab - self.curx) as usize;
                 for _ in 0..spaces {
                     let space = CCharT::from_char_attr(' ', ch.attr);
@@ -973,6 +979,16 @@ impl Window {
         if cell.add_combining(combining) {
             self.lines[y].set(x, cell);
         }
+    }
+
+    /// Handle a tab whose tab stop lies past the right edge: the rest of the
+    /// line is cleared and the cursor goes to the start of the next line,
+    /// not on to the tab stop it would have reached there.
+    fn tab_past_the_right_edge(&mut self) -> Result<()> {
+        self.clrtoeol()?;
+        self.flags |= WindowFlags::WRAPPED;
+        self.curx = if self.next_line()? { 0 } else { self.maxx };
+        Ok(())
     }
 
     /// Advance the cursor after character output.
@@ -3328,6 +3344,63 @@ mod tests {
         win.mv(0, 4).unwrap();
         win.ins_wch(&CCharT::from_char('本')).unwrap();
         assert_eq!(cells(&win, 0), ['日', '\0', 'x', 'a', '本', '\0']);
+    }
+
+    #[test]
+    fn test_tab_moves_to_the_next_tab_stop() {
+        let mut win = Window::new(2, 20, 0, 0).unwrap();
+        win.mvaddstr(0, 3, "\tx").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (0, 9));
+        win.mvaddstr(1, 8, "\ty").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 17));
+        assert_eq!(
+            rows_of(&mut win, 20),
+            ["        x           ", "                y   "]
+        );
+    }
+
+    #[test]
+    fn test_tab_past_the_right_edge_goes_to_the_start_of_the_next_line() {
+        for column in [8, 9] {
+            let mut win = Window::new(2, 10, 0, 0).unwrap();
+            win.mvaddstr(0, 0, "0123456789").unwrap();
+            win.mvaddstr(0, column, "\tx").unwrap();
+            assert_eq!(
+                (win.getcury(), win.getcurx()),
+                (1, 1),
+                "from column {column}"
+            );
+            let kept = &"0123456789"[..column as usize];
+            assert_eq!(
+                rows_of(&mut win, 10),
+                [format!("{kept:<10}"), "x         ".to_string()]
+            );
+        }
+
+        // The last tab stop inside the window is still reached.
+        let mut win = Window::new(2, 10, 0, 0).unwrap();
+        win.mvaddstr(0, 5, "\tx").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (0, 9));
+        assert_eq!(rows_of(&mut win, 10), ["        x ", "          "]);
+    }
+
+    #[test]
+    fn test_tab_past_the_right_edge_of_the_last_line() {
+        // Nowhere to go without scrolling: the cursor stops at the edge.
+        let mut win = Window::new(2, 10, 0, 0).unwrap();
+        win.mvaddstr(1, 8, "ab").unwrap();
+        win.mvaddstr(1, 8, "\t").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 9));
+        assert_eq!(rows_of(&mut win, 10)[1], "          ");
+
+        // With scrolling the window scrolls.
+        let mut win = Window::new(2, 10, 0, 0).unwrap();
+        win.scrollok(true);
+        win.mvaddstr(0, 0, "top").unwrap();
+        win.mvaddstr(1, 0, "bottom").unwrap();
+        win.mvaddstr(1, 8, "\tx").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 1));
+        assert_eq!(rows_of(&mut win, 10), ["bottom    ", "x         "]);
     }
 
     #[test]
