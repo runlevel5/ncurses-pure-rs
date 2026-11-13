@@ -994,9 +994,10 @@ impl Window {
     /// does, and say whether it moved.
     ///
     /// On the last line of the scroll region the region scrolls up instead
-    /// and the cursor stays on that line, if scrolling is enabled. Without
-    /// scrolling the cursor does not move from there, nor from the last line
-    /// of the window.
+    /// and the cursor stays on that line, if scrolling is enabled; without
+    /// scrolling the cursor cannot move from there. On the last line of the
+    /// window, below the scroll region, nothing scrolls and the cursor
+    /// carries on at the start of that same line.
     fn next_line(&mut self) -> Result<bool> {
         if self.cury == self.regbottom {
             if !self.scroll {
@@ -1005,8 +1006,6 @@ impl Window {
             self.scroll_up(1)?;
         } else if self.cury < self.maxy {
             self.cury += 1;
-        } else {
-            return Ok(false);
         }
         Ok(true)
     }
@@ -3372,14 +3371,38 @@ mod tests {
         win.addch('\n' as ChType).unwrap();
         assert_eq!((win.getcury(), win.getcurx()), (1, 0));
 
-        // Below it: down to the last line of the window, and no further.
+        // Below it: down to the last line of the window. From there the
+        // cursor goes back to the start of that line.
         win.mv(3, 2).unwrap();
         win.addch('\n' as ChType).unwrap();
         assert_eq!((win.getcury(), win.getcurx()), (4, 0));
         win.mv(4, 2).unwrap();
         win.addch('\n' as ChType).unwrap();
-        assert_eq!((win.getcury(), win.getcurx()), (4, 2));
+        assert_eq!((win.getcury(), win.getcurx()), (4, 0));
         assert_eq!(rows(&mut win), ["aa ", "bbb", "ccc", "dd ", "ee "]);
+    }
+
+    #[test]
+    fn test_wrapping_on_the_last_line_below_the_scroll_region_stays_on_it() {
+        // With or without scrolling: the region is not involved.
+        for scrolling in [true, false] {
+            let mut win = five_lines(0);
+            win.scrollok(scrolling);
+            win.setscrreg(1, 2).unwrap();
+            win.mv(4, 2).unwrap();
+            win.addstr("XY").unwrap();
+            assert_eq!((win.getcury(), win.getcurx()), (4, 1));
+            assert_eq!(rows(&mut win), ["aaa", "bbb", "ccc", "ddd", "YeX"]);
+        }
+
+        // One line higher the text runs on to the last line.
+        let mut win = five_lines(0);
+        win.scrollok(true);
+        win.setscrreg(1, 2).unwrap();
+        win.mv(3, 2).unwrap();
+        win.addstr("XY").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (4, 1));
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "ccc", "ddX", "Yee"]);
     }
 
     #[test]
