@@ -910,8 +910,12 @@ impl Screen {
                 None => continue,
             };
 
-            // Only the changed part of a changed line is looked at.
-            let range = if newscr_line.is_touched() {
+            // After a clear the terminal shows nothing, so every cell that
+            // is not blank has to be sent again, changed or not. Otherwise
+            // only the changed part of a changed line is looked at.
+            let range = if do_clear {
+                Some((0, cols - 1))
+            } else if newscr_line.is_touched() {
                 newscr_line.changed_range()
             } else {
                 None
@@ -922,7 +926,7 @@ impl Screen {
 
             for x in first..=last.min(cols - 1) {
                 let new_cell = newscr_line.get(x);
-                if new_cell == curscr_line.get(x) && !do_clear {
+                if new_cell == curscr_line.get(x) {
                     continue;
                 }
 
@@ -2968,14 +2972,46 @@ impl Screen {
     }
 
     /// Mark a window for complete redraw on next refresh.
+    ///
+    /// Use this when something else has written to the terminal: the next
+    /// refresh of the window sends all of it again, changed or not.
     pub fn redrawwin(&mut self, win: &mut Window) -> Result<()> {
-        win.touchwin();
-        Ok(())
+        self.wredrawln(win, 0, win.getmaxy())
     }
 
     /// Request that lines be redrawn (to fix screen corruption).
+    ///
+    /// The next refresh of the window sends `num_lines` lines from
+    /// `beg_line` again, changed or not.
     pub fn wredrawln(&mut self, win: &mut Window, beg_line: i32, num_lines: i32) -> Result<()> {
         win.touchln(beg_line, num_lines, true);
+        if beg_line < 0 || num_lines < 0 {
+            return Ok(());
+        }
+
+        // Touching alone sends nothing, because the lines still match what
+        // was last sent. Forget what the terminal shows there, so that every
+        // cell counts as changed.
+        #[cfg(not(feature = "wide"))]
+        let unknown: ChType = 0;
+        #[cfg(feature = "wide")]
+        let unknown = crate::wide::CCharT::new();
+
+        let end_line = beg_line.saturating_add(num_lines).min(win.getmaxy());
+        for y in beg_line..end_line {
+            let Ok(screen_y) = usize::try_from(win.getbegy() + y) else {
+                continue;
+            };
+            let Some(line) = self.curscr.line_mut(screen_y) else {
+                continue;
+            };
+            for x in 0..win.getmaxx() {
+                if let Ok(screen_x) = usize::try_from(win.getbegx() + x) {
+                    line.set(screen_x, unknown);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -5551,6 +5587,13 @@ mod output_tests {
             self.show();
             self.shown.rows()
         }
+
+        /// Refresh a window and return what the terminal shows.
+        fn wrefresh(&mut self, win: &mut Window) -> Vec<String> {
+            self.screen.wrefresh(win).unwrap();
+            self.show();
+            self.shown.rows()
+        }
     }
 
     #[test]
@@ -5618,5 +5661,90 @@ mod output_tests {
         t.screen.mvaddstr(0, 0, "wxyz").unwrap();
         assert_eq!(t.refresh(), ["wxyzaX", ""]);
         assert_eq!(t.shown.cells[0][..6], ['w', 'x', 'y', 'z', 'a', 'X']);
+    }
+
+    #[test]
+    fn test_clearok_repaints_the_whole_screen() {
+        let mut t = TestScreen::new(3, 10);
+        t.screen.mvaddstr(0, 0, "top").unwrap();
+        t.screen.mvaddstr(2, 4, "bottom").unwrap();
+        let drawn = ["top", "", "    bottom"];
+        assert_eq!(t.refresh(), drawn);
+
+        // Something else wrote all over the terminal.
+        t.shown.fill('#');
+        t.screen.stdscr_mut().clearok(true);
+        assert_eq!(t.refresh(), drawn);
+
+        // The clear happens once.
+        t.shown.fill('#');
+        assert_eq!(t.refresh(), ["##########"; 3]);
+    }
+
+    #[test]
+    fn test_clearok_repaints_double_width_characters() {
+        let mut t = TestScreen::new(2, 10);
+        t.screen.mvaddstr(1, 1, "日本ab").unwrap();
+        t.refresh();
+        t.shown.fill('#');
+        t.screen.stdscr_mut().clearok(true);
+        assert_eq!(t.refresh(), ["", " 日本ab"]);
+    }
+
+    #[test]
+    fn test_clear_removes_the_old_content_and_shows_the_new() {
+        let mut t = TestScreen::new(3, 10);
+        t.screen.mvaddstr(0, 0, "old").unwrap();
+        t.screen.mvaddstr(2, 0, "old too").unwrap();
+        t.refresh();
+        t.screen.clear().unwrap();
+        t.screen.mvaddstr(1, 1, "new").unwrap();
+        assert_eq!(t.refresh(), ["", " new", ""]);
+    }
+
+    #[test]
+    fn test_redrawwin_repaints_the_window_and_nothing_else() {
+        let mut t = TestScreen::new(4, 8);
+        let mut win = t.screen.newwin(2, 4, 1, 2).unwrap();
+        win.mvaddstr(0, 0, "ab").unwrap();
+        win.mvaddstr(1, 0, "cdef").unwrap();
+        assert_eq!(t.wrefresh(&mut win), ["", "  ab", "  cdef", ""]);
+
+        // Touching the window is not enough to repair the terminal.
+        t.shown.fill('#');
+        t.screen.redrawwin(&mut win).unwrap();
+        assert_eq!(
+            t.wrefresh(&mut win),
+            ["########", "##ab  ##", "##cdef##", "########"]
+        );
+    }
+
+    #[test]
+    fn test_wredrawln_repaints_only_the_lines_asked_for() {
+        let mut t = TestScreen::new(4, 8);
+        let mut win = t.screen.newwin(3, 4, 0, 2).unwrap();
+        for (y, text) in ["abcd", "efgh", "ijkl"].into_iter().enumerate() {
+            win.mvaddstr(y as i32, 0, text).unwrap();
+        }
+        t.wrefresh(&mut win);
+
+        t.shown.fill('#');
+        t.screen.wredrawln(&mut win, 1, 1).unwrap();
+        assert_eq!(
+            t.wrefresh(&mut win),
+            ["########", "##efgh##", "########", "########"]
+        );
+
+        // A range running past the window stops at its last line, and bad
+        // arguments are ignored.
+        t.shown.fill('#');
+        t.screen.wredrawln(&mut win, 2, 100).unwrap();
+        t.screen.wredrawln(&mut win, -1, 2).unwrap();
+        t.screen.wredrawln(&mut win, 0, -1).unwrap();
+        t.screen.wredrawln(&mut win, 7, 1).unwrap();
+        assert_eq!(
+            t.wrefresh(&mut win),
+            ["########", "########", "##ijkl##", "########"]
+        );
     }
 }
