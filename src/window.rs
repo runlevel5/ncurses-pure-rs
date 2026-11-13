@@ -1318,13 +1318,16 @@ impl Window {
 
     /// Scroll the window up by n lines.
     pub fn scroll_up(&mut self, n: i32) -> Result<()> {
-        if n <= 0 {
-            return Ok(());
+        if n > 0 {
+            self.shift_lines_up(n, self.regtop as usize, self.regbottom as usize);
         }
+        Ok(())
+    }
 
-        let n = n.min((self.regbottom - self.regtop + 1) as i32) as usize;
-        let top = self.regtop as usize;
-        let bottom = self.regbottom as usize;
+    /// Move the lines `top..=bottom` up by `n` (which must be positive),
+    /// dropping the first `n` of them and clearing the last `n`.
+    fn shift_lines_up(&mut self, n: i32, top: usize, bottom: usize) {
+        let n = (n as usize).min(bottom + 1 - top);
 
         #[cfg(not(feature = "wide"))]
         let fill = self.bkgd;
@@ -1345,19 +1348,20 @@ impl Window {
         for line in &mut self.lines[first_cleared..=bottom] {
             line.fill(fill);
         }
-
-        Ok(())
     }
 
     /// Scroll the window down by n lines.
     pub fn scroll_down(&mut self, n: i32) -> Result<()> {
-        if n <= 0 {
-            return Ok(());
+        if n > 0 {
+            self.shift_lines_down(n, self.regtop as usize, self.regbottom as usize);
         }
+        Ok(())
+    }
 
-        let n = n.min((self.regbottom - self.regtop + 1) as i32) as usize;
-        let top = self.regtop as usize;
-        let bottom = self.regbottom as usize;
+    /// Move the lines `top..=bottom` down by `n` (which must be positive),
+    /// dropping the last `n` of them and clearing the first `n`.
+    fn shift_lines_down(&mut self, n: i32, top: usize, bottom: usize) {
+        let n = (n as usize).min(bottom + 1 - top);
 
         #[cfg(not(feature = "wide"))]
         let fill = self.bkgd;
@@ -1374,8 +1378,6 @@ impl Window {
         for line in &mut self.lines[top..(top + n)] {
             line.fill(fill);
         }
-
-        Ok(())
     }
 
     /// Scroll the scrolling region (wscrl).
@@ -1979,17 +1981,21 @@ impl Window {
         self.insdelln(-1)
     }
 
-    /// Insert or delete lines.
+    /// Insert or delete lines at the cursor.
+    ///
+    /// A positive `n` inserts `n` blank lines above the current line: it and
+    /// the lines below move down, and the last `n` lines of the window are
+    /// lost. A negative `n` deletes that many lines starting with the current
+    /// one: the lines below move up, and blank lines fill the bottom. Lines
+    /// above the cursor are not touched, and the scroll region plays no part.
     pub fn insdelln(&mut self, n: i32) -> Result<()> {
+        let (top, bottom) = (self.cury as usize, self.maxy as usize);
         if n > 0 {
-            // Insert lines (scroll down)
-            self.scroll_down(n)
+            self.shift_lines_down(n, top, bottom);
         } else if n < 0 {
-            // Delete lines (scroll up)
-            self.scroll_up(-n)
-        } else {
-            Ok(())
+            self.shift_lines_up(n.saturating_neg(), top, bottom);
         }
+        Ok(())
     }
 
     // ========================================================================
@@ -2819,6 +2825,73 @@ mod tests {
         }
         win.scroll_up(1).unwrap();
         assert_eq!(rows(&mut win), ["bbb", "ccc", "   "]);
+    }
+
+    /// A five-line window holding `aaa` to `eee`, with the cursor on `row`.
+    fn five_lines(row: i32) -> Window {
+        let mut win = Window::new(5, 3, 0, 0).unwrap();
+        for (y, text) in ["aaa", "bbb", "ccc", "ddd", "eee"].into_iter().enumerate() {
+            win.mvaddstr(y as i32, 0, text).unwrap();
+        }
+        win.mv(row, 0).unwrap();
+        win
+    }
+
+    #[test]
+    fn test_insertln_inserts_above_the_cursor_line() {
+        let mut win = five_lines(2);
+        win.insertln().unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "   ", "ccc", "ddd"]);
+    }
+
+    #[test]
+    fn test_deleteln_deletes_the_cursor_line() {
+        let mut win = five_lines(2);
+        win.deleteln().unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "ddd", "eee", "   "]);
+    }
+
+    #[test]
+    fn test_insdelln_counts_are_cut_off_at_the_bottom_of_the_window() {
+        let mut win = five_lines(3);
+        win.insdelln(2).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "ccc", "   ", "   "]);
+
+        for n in [100, i32::MAX, -100, i32::MIN] {
+            let mut win = five_lines(1);
+            win.insdelln(n).unwrap();
+            assert_eq!(
+                rows(&mut win),
+                ["aaa", "   ", "   ", "   ", "   "],
+                "insdelln({n})"
+            );
+        }
+
+        let mut win = five_lines(4);
+        win.insdelln(0).unwrap();
+        win.insertln().unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "ccc", "ddd", "   "]);
+    }
+
+    #[test]
+    fn test_insdelln_ignores_the_scroll_region() {
+        let mut win = five_lines(1);
+        win.setscrreg(2, 3).unwrap();
+        win.mv(1, 0).unwrap();
+        win.insdelln(-1).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "ccc", "ddd", "eee", "   "]);
+    }
+
+    #[test]
+    fn test_scrolling_stays_inside_the_scroll_region() {
+        let mut win = five_lines(0);
+        win.setscrreg(1, 3).unwrap();
+        win.scroll_up(1).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "ccc", "ddd", "   ", "eee"]);
+        win.scroll_down(2).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "   ", "   ", "ccc", "eee"]);
+        win.scroll_down(i32::MAX).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "   ", "   ", "   ", "eee"]);
     }
 
     #[test]
