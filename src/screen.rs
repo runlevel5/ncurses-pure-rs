@@ -181,17 +181,10 @@ impl Screen {
     /// you can call `refresh()` to re-enter curses mode if needed.
     pub fn endwin(&mut self) -> Result<()> {
         if self.initialized {
-            // Disable mouse if enabled
+            // Stop mouse reports while curses mode is left. The protocol is
+            // remembered, so that coming back can switch them on again.
             #[cfg(feature = "mouse")]
-            if self.mouse_protocol != MouseProtocol::None {
-                let _ = self
-                    .terminal
-                    .write(self.mouse_protocol.disable_sequence().as_bytes());
-                let _ = self
-                    .terminal
-                    .write(MouseProtocol::ButtonEvent.disable_sequence().as_bytes());
-                self.mouse_protocol = MouseProtocol::None;
-            }
+            self.set_mouse_reporting(false);
 
             // Show cursor
             self.terminal.cursor_visible(true)?;
@@ -686,27 +679,34 @@ impl Screen {
         if newmask != 0 && self.mouse_protocol == MouseProtocol::None {
             // Enable SGR mouse protocol (most modern and feature-rich)
             self.mouse_protocol = MouseProtocol::Sgr;
-            let _ = self
-                .terminal
-                .write(MouseProtocol::Sgr.enable_sequence().as_bytes());
-            // Also enable button event tracking
-            let _ = self
-                .terminal
-                .write(MouseProtocol::ButtonEvent.enable_sequence().as_bytes());
+            self.set_mouse_reporting(true);
             let _ = self.terminal.flush();
         } else if newmask == 0 && self.mouse_protocol != MouseProtocol::None {
             // Disable mouse reporting
-            let _ = self
-                .terminal
-                .write(self.mouse_protocol.disable_sequence().as_bytes());
-            let _ = self
-                .terminal
-                .write(MouseProtocol::ButtonEvent.disable_sequence().as_bytes());
+            self.set_mouse_reporting(false);
             let _ = self.terminal.flush();
             self.mouse_protocol = MouseProtocol::None;
         }
 
         old
+    }
+
+    /// Tell the terminal to start or stop sending mouse reports in the
+    /// protocol in use, along with button event tracking. Does nothing when
+    /// the mouse is not in use.
+    #[cfg(feature = "mouse")]
+    fn set_mouse_reporting(&mut self, on: bool) {
+        if self.mouse_protocol == MouseProtocol::None {
+            return;
+        }
+        for protocol in [self.mouse_protocol, MouseProtocol::ButtonEvent] {
+            let sequence = if on {
+                protocol.enable_sequence()
+            } else {
+                protocol.disable_sequence()
+            };
+            let _ = self.terminal.write(sequence.as_bytes());
+        }
     }
 
     /// Get the next mouse event.
@@ -921,6 +921,8 @@ impl Screen {
         self.terminal.echo(self.input_mode.echo)?;
         self.terminal
             .cursor_visible(self.cursor_visibility != CursorVisibility::Invisible)?;
+        #[cfg(feature = "mouse")]
+        self.set_mouse_reporting(true);
         self.initialized = true;
 
         // The terminal shows the alternate screen afresh: repaint all of it.
@@ -5913,6 +5915,49 @@ mod output_tests {
         t.wrefresh(&mut win);
         assert!(!t.screen.isendwin());
         assert_eq!(t.shown.rows(), ["", " win", ""]);
+    }
+
+    #[cfg(feature = "mouse")]
+    #[test]
+    fn test_returning_from_endwin_switches_mouse_reports_back_on() {
+        use crate::mouse::*;
+
+        let on = MouseProtocol::Sgr.enable_sequence();
+        let off = MouseProtocol::Sgr.disable_sequence();
+
+        let mut t = keypad_screen();
+        t.screen.mousemask(ALL_MOUSE_EVENTS);
+        t.screen.mouseinterval(10_000);
+        assert!(t.show().contains(on));
+
+        t.screen.endwin().unwrap();
+        let output = t.show();
+        assert!(output.contains(off) && !output.contains(on), "{output:?}");
+        assert!(t.screen.has_mouse());
+
+        t.screen.refresh().unwrap();
+        let output = t.show();
+        assert!(output.contains(on) && !output.contains(off), "{output:?}");
+
+        // Mouse reports are decoded as before.
+        t.type_bytes(b"\x1b[<0;3;2M");
+        assert_eq!(t.read_keys(1), [KEY_MOUSE]);
+        assert_eq!(t.screen.getmouse().unwrap().bstate, BUTTON1_PRESSED);
+
+        // Without a mouse mask nothing is switched on.
+        let mut t = keypad_screen();
+        t.screen.endwin().unwrap();
+        t.screen.refresh().unwrap();
+        assert!(!t.show().contains(on));
+
+        // A mask cleared while curses mode is left stays cleared.
+        let mut t = keypad_screen();
+        t.screen.mousemask(ALL_MOUSE_EVENTS);
+        t.screen.endwin().unwrap();
+        t.screen.mousemask(0);
+        t.show();
+        t.screen.refresh().unwrap();
+        assert!(!t.show().contains(on));
     }
 
     #[test]
