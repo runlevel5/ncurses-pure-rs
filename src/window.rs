@@ -427,6 +427,9 @@ impl Window {
             line.resize(new_width, fill);
         }
 
+        // A scroll region covering the whole window keeps covering it.
+        let region_was_whole_window = self.regtop == 0 && self.regbottom == self.maxy;
+
         // Update dimensions
         self.maxy = (new_height - 1) as NcursesSize;
         self.maxx = (new_width - 1) as NcursesSize;
@@ -439,9 +442,12 @@ impl Window {
             self.curx = self.maxx;
         }
 
-        // Update scroll region
-        if self.regbottom >= new_height as NcursesSize {
+        // Update scroll region: it must stay inside the window.
+        if region_was_whole_window {
             self.regbottom = self.maxy;
+        } else {
+            self.regtop = self.regtop.min(self.maxy);
+            self.regbottom = self.regbottom.min(self.maxy);
         }
 
         // Touch entire window to ensure refresh
@@ -2766,6 +2772,53 @@ mod tests {
             win.touchln(start, count, true);
             assert_eq!(touched(&win), [false; 5], "touchln({start}, {count})");
         }
+    }
+
+    #[test]
+    fn test_resize_keeps_the_scroll_region_inside_the_window() {
+        let mut win = Window::new(10, 3, 0, 0).unwrap();
+        win.scrollok(true);
+        win.setscrreg(5, 9).unwrap();
+        win.resize(3, 3).unwrap();
+        assert_eq!(win.getscrreg(), (2, 2));
+
+        // Scrolling the shrunken region used to panic.
+        for (y, text) in ["aaa", "bbb", "ccc"].into_iter().enumerate() {
+            win.mvaddstr(y as i32, 0, text).unwrap();
+        }
+        win.scrl(1).unwrap();
+        assert_eq!(rows(&mut win), ["aaa", "bbb", "   "]);
+        win.scrl(-1).unwrap();
+        win.scroll_up(1).unwrap();
+        win.scroll_down(1).unwrap();
+    }
+
+    #[test]
+    fn test_resize_keeps_a_scroll_region_that_still_fits() {
+        let mut win = Window::new(10, 3, 0, 0).unwrap();
+        win.setscrreg(1, 3).unwrap();
+        win.resize(6, 3).unwrap();
+        assert_eq!(win.getscrreg(), (1, 3));
+        win.resize(3, 3).unwrap();
+        assert_eq!(win.getscrreg(), (1, 2));
+    }
+
+    #[test]
+    fn test_resize_keeps_a_whole_window_scroll_region_whole() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        assert_eq!(win.getscrreg(), (0, 2));
+        win.resize(5, 3).unwrap();
+        assert_eq!(win.getscrreg(), (0, 4));
+        win.resize(2, 3).unwrap();
+        assert_eq!(win.getscrreg(), (0, 1));
+
+        // The lines added by growing scroll with the rest.
+        win.resize(3, 3).unwrap();
+        for (y, text) in ["aaa", "bbb", "ccc"].into_iter().enumerate() {
+            win.mvaddstr(y as i32, 0, text).unwrap();
+        }
+        win.scroll_up(1).unwrap();
+        assert_eq!(rows(&mut win), ["bbb", "ccc", "   "]);
     }
 
     #[test]
