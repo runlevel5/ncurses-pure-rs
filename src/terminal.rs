@@ -156,6 +156,16 @@ pub enum InputWait {
 /// as `TimedOut`, so a bad descriptor cannot turn a blocking read into a
 /// busy loop.
 pub(crate) fn poll_readable(fd: RawFd, timeout: Option<Duration>) -> InputWait {
+    poll_fd(fd, libc::POLLIN, timeout)
+}
+
+/// Wait until `fd` can be written to without blocking, or a signal arrives.
+fn poll_writable(fd: RawFd) -> InputWait {
+    poll_fd(fd, libc::POLLOUT, None)
+}
+
+/// Wait for `events` on `fd`: see [`poll_readable`].
+fn poll_fd(fd: RawFd, events: libc::c_short, timeout: Option<Duration>) -> InputWait {
     let timeout_ms: libc::c_int = match timeout {
         None => -1,
         Some(t) => t.as_micros().div_ceil(1000).min(libc::c_int::MAX as u128) as libc::c_int,
@@ -163,7 +173,7 @@ pub(crate) fn poll_readable(fd: RawFd, timeout: Option<Duration>) -> InputWait {
 
     let mut pollfd = libc::pollfd {
         fd,
-        events: libc::POLLIN,
+        events,
         revents: 0,
     };
 
@@ -172,7 +182,7 @@ pub(crate) fn poll_readable(fd: RawFd, timeout: Option<Duration>) -> InputWait {
     let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
 
     if result > 0 {
-        // Readable, or hung up / errored: either way a read will not block
+        // Ready, or hung up / errored: either way the call will not block
         InputWait::Ready
     } else if result == 0 {
         InputWait::TimedOut
@@ -910,33 +920,47 @@ impl Terminal {
     }
 
     /// Flush the output buffer to the terminal.
+    ///
+    /// Everything in the buffer is written before this returns: a write
+    /// that takes only part of it, is interrupted by a signal, or finds a
+    /// non-blocking descriptor full is carried on with. On any other error
+    /// the rest of the buffer is discarded.
     pub fn flush(&mut self) -> Result<()> {
-        if self.output_buffer.is_empty() {
-            return Ok(());
-        }
+        let mut written = 0;
+        let result = loop {
+            let rest = &self.output_buffer[written..];
+            if rest.is_empty() {
+                break Ok(());
+            }
 
-        // SAFETY: `libc::write` writes data to a file descriptor.
-        // - `self.output_fd` is a valid file descriptor (validated in `new()`)
-        // - `self.output_buffer.as_ptr()` returns a valid pointer to the buffer's data
-        // - `self.output_buffer.len()` is the exact number of bytes to write
-        // - The buffer remains valid and unchanged during the write call
-        let result = unsafe {
-            libc::write(
-                self.output_fd,
-                self.output_buffer.as_ptr() as *const libc::c_void,
-                self.output_buffer.len(),
-            )
+            // SAFETY: `libc::write` writes data to a file descriptor.
+            // - `self.output_fd` is a valid file descriptor (validated in `new()`)
+            // - `rest.as_ptr()` points to `rest.len()` initialised bytes
+            // - The buffer remains valid and unchanged during the write call
+            let result = unsafe {
+                libc::write(
+                    self.output_fd,
+                    rest.as_ptr() as *const libc::c_void,
+                    rest.len(),
+                )
+            };
+
+            match usize::try_from(result) {
+                // Nothing was taken and no error given: stop instead of spinning
+                Ok(0) => break Err(Error::SystemError(libc::EIO)),
+                Ok(n) => written += n,
+                Err(_) => match io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    Some(libc::EAGAIN) => {
+                        poll_writable(self.output_fd);
+                    }
+                    errno => break Err(Error::SystemError(errno.unwrap_or(-1))),
+                },
+            }
         };
 
         self.output_buffer.clear();
-
-        if result < 0 {
-            Err(Error::SystemError(
-                io::Error::last_os_error().raw_os_error().unwrap_or(-1),
-            ))
-        } else {
-            Ok(())
-        }
+        result
     }
 
     /// Read a single byte from the terminal.
@@ -1448,6 +1472,110 @@ mod tests {
     #[test]
     fn test_term_state() {
         assert_eq!(TermState::default(), TermState::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// A terminal writing to a pipe, and the pipe's read end.
+    fn terminal_on_a_pipe() -> (Terminal, std::fs::File, OwnedFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a valid two-element array for pipe() to fill
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors were just created and are owned by
+        // nothing else.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let terminal = Terminal::new(write.as_raw_fd(), write.as_raw_fd()).unwrap();
+        assert!(terminal.is_no_tty());
+        (terminal, std::fs::File::from(read), write)
+    }
+
+    fn set_nonblocking(fd: RawFd) {
+        // SAFETY: `fd` is an open descriptor; F_GETFL and F_SETFL only read
+        // and change its status flags.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert!(flags >= 0);
+            assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+        }
+    }
+
+    /// Bytes that show up any loss or reordering.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn flush_writes_the_buffer() {
+        let (mut terminal, mut output, write) = terminal_on_a_pipe();
+        terminal.write(b"hello ").unwrap();
+        terminal.write_str("world").unwrap();
+        terminal.flush().unwrap();
+        // Flushing again writes nothing more.
+        terminal.flush().unwrap();
+        drop((terminal, write));
+
+        let mut written = String::new();
+        output.read_to_string(&mut written).unwrap();
+        assert_eq!(written, "hello world");
+    }
+
+    #[test]
+    fn flush_writes_everything_when_the_descriptor_takes_it_in_pieces() {
+        // More than a pipe holds (up to 1 MiB where pages are 64 KiB), on a
+        // descriptor that will not block: the first write takes part of it
+        // and the next finds the pipe full.
+        let data = pattern(3_000_000);
+        let (mut terminal, mut output, write) = terminal_on_a_pipe();
+        set_nonblocking(write.as_raw_fd());
+
+        let expected = data.len();
+        let reader = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while received.len() < expected {
+                // Read slowly at first, so the writer meets a full pipe.
+                if received.len() < 3 * chunk.len() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                match output.read(&mut chunk).unwrap() {
+                    0 => break,
+                    n => received.extend_from_slice(&chunk[..n]),
+                }
+            }
+            received
+        });
+
+        terminal.write(&data).unwrap();
+        terminal.flush().unwrap();
+        drop((terminal, write));
+
+        let received = reader.join().unwrap();
+        assert_eq!(received.len(), data.len());
+        assert!(
+            received == data,
+            "the bytes arrived changed or out of order"
+        );
+    }
+
+    #[test]
+    fn flush_reports_an_error_and_drops_the_buffer() {
+        let (mut terminal, output, write) = terminal_on_a_pipe();
+        // Nobody will ever read: writing fails with EPIPE. Rust ignores
+        // SIGPIPE, so the write returns the error.
+        drop(output);
+        terminal.write(b"lost").unwrap();
+        assert!(matches!(
+            terminal.flush(),
+            Err(Error::SystemError(libc::EPIPE))
+        ));
+        // The failed output is not sent again later.
+        terminal.flush().unwrap();
+        drop((terminal, write));
     }
 }
 
