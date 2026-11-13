@@ -82,9 +82,9 @@ impl CCharT {
     ///
     /// Returns `true` if the character was added, `false` if there's no room.
     pub fn add_combining(&mut self, ch: char) -> bool {
-        for i in 1..CCHARW_MAX {
-            if self.chars[i] == '\0' {
-                self.chars[i] = ch;
+        for slot in &mut self.chars[1..] {
+            if *slot == '\0' {
+                *slot = ch;
                 return true;
             }
         }

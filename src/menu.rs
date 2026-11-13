@@ -666,7 +666,7 @@ impl Menu {
                 if let Some(item) = self.items.get(self.current) {
                     let mut item = item.borrow_mut();
                     if item.is_selectable() {
-                        item.selected = !item.selected;
+                        item.selected.toggle();
                     }
                 }
             }
