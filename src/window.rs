@@ -305,8 +305,33 @@ impl Window {
             return Err(Error::InvalidArgument("negative window dimensions".into()));
         }
 
-        let height = if nlines == 0 { 24 } else { nlines } as usize;
-        let width = if ncols == 0 { 80 } else { ncols } as usize;
+        // A size of 0 means the rest of the screen from the window's origin
+        let nlines = if nlines == 0 {
+            crate::screen::globals::LINES() - begy
+        } else {
+            nlines
+        };
+        let ncols = if ncols == 0 {
+            crate::screen::globals::COLS() - begx
+        } else {
+            ncols
+        };
+        if nlines <= 0 || ncols <= 0 {
+            return Err(Error::InvalidArgument(
+                "window origin is outside the screen".into(),
+            ));
+        }
+
+        // Sizes and positions are kept as `NcursesSize`
+        let limit = i32::from(NcursesSize::MAX);
+        if nlines > limit || ncols > limit || begy > limit || begx > limit {
+            return Err(Error::InvalidArgument(format!(
+                "window dimensions must not be larger than {limit}"
+            )));
+        }
+
+        let height = nlines as usize;
+        let width = ncols as usize;
 
         let mut lines = Vec::with_capacity(height);
         for _ in 0..height {
@@ -521,6 +546,11 @@ impl Window {
         } else {
             ncols
         };
+        if height <= 0 || width <= 0 {
+            return Err(Error::InvalidArgument(
+                "subwindow origin leaves no room inside the parent".into(),
+            ));
+        }
 
         let mut win = Self::new(height, width, begy, begx)?;
         win.flags |= WindowFlags::SUBWIN;
@@ -570,6 +600,11 @@ impl Window {
             ncols
         };
 
+        if height <= 0 || width <= 0 {
+            return Err(Error::InvalidArgument(
+                "derived window origin leaves no room inside the parent".into(),
+            ));
+        }
         if begy + height > self.getmaxy() || begx + width > self.getmaxx() {
             return Err(Error::InvalidArgument(
                 "derived window extends beyond parent boundaries".into(),
@@ -3043,6 +3078,58 @@ mod tests {
         win.addch(' ' as ChType).unwrap();
         assert_eq!(cell(&win, 0, 0), ('a', A_BOLD | A_UNDERLINE));
         assert_eq!(cell(&win, 0, 1), (' ', A_UNDERLINE));
+    }
+
+    #[test]
+    fn test_window_size_of_zero_means_the_rest_of_the_screen() {
+        use crate::screen::globals::{COLS, LINES};
+
+        let (lines, cols) = (LINES(), COLS());
+        let whole = Window::new(0, 0, 0, 0).unwrap();
+        assert_eq!((whole.getmaxy(), whole.getmaxx()), (lines, cols));
+        let part = Window::new(0, 0, 3, 4).unwrap();
+        assert_eq!((part.getmaxy(), part.getmaxx()), (lines - 3, cols - 4));
+        let mixed = Window::new(2, 0, 0, 10).unwrap();
+        assert_eq!((mixed.getmaxy(), mixed.getmaxx()), (2, cols - 10));
+
+        // An origin on or past the screen's edge leaves no room.
+        assert!(Window::new(0, 0, lines, 0).is_err());
+        assert!(Window::new(0, 0, 0, cols).is_err());
+        assert!(Window::new(0, 5, lines + 1, 0).is_err());
+    }
+
+    #[test]
+    fn test_window_dimensions_have_to_fit_their_type() {
+        assert!(Window::new(40_000, 2, 0, 0).is_err());
+        assert!(Window::new(2, 40_000, 0, 0).is_err());
+        assert!(Window::new(2, 2, 40_000, 0).is_err());
+        assert!(Window::new(2, 2, 0, 40_000).is_err());
+        assert!(Window::new(i32::MAX, i32::MAX, 0, 0).is_err());
+        assert!(Window::new_pad(40_000, 2).is_err());
+        assert!(Window::new(-1, 5, 0, 0).is_err());
+
+        // The largest size there is still works.
+        let tall = Window::new(32_767, 1, 0, 0).unwrap();
+        assert_eq!((tall.getmaxy(), tall.getmaxx()), (32_767, 1));
+        let pad = Window::new_pad(1, 32_767).unwrap();
+        assert_eq!(pad.getmaxx(), 32_767);
+    }
+
+    #[test]
+    fn test_subwindow_size_of_zero_means_the_rest_of_the_parent() {
+        let parent = Window::new(5, 5, 10, 20).unwrap();
+
+        let derived = parent.derwin(0, 0, 2, 2).unwrap();
+        assert_eq!((derived.getmaxy(), derived.getmaxx()), (3, 3));
+        assert_eq!((derived.getbegy(), derived.getbegx()), (12, 22));
+        let sub = parent.subwin(0, 0, 12, 22).unwrap();
+        assert_eq!((sub.getmaxy(), sub.getmaxx()), (3, 3));
+
+        // At the parent's far corner there is nothing left to give.
+        assert!(parent.derwin(0, 0, 5, 5).is_err());
+        assert!(parent.derwin(0, 2, 5, 0).is_err());
+        assert!(parent.subwin(0, 0, 15, 25).is_err());
+        assert!(parent.subwin(2, 0, 10, 25).is_err());
     }
 
     #[test]
