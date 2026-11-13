@@ -887,17 +887,32 @@ impl Window {
             return Ok(());
         }
 
-        // Handle wide characters (2-column)
-        let width = ch.width();
-        if x + width > (self.maxx + 1) as usize {
-            // Character doesn't fit, wrap or don't draw
-            if self.scroll && y == self.maxy as usize {
-                // At bottom, need to scroll
-            }
-            // For now, just don't draw if it doesn't fit
-            self.advance_cursor()?;
+        // A combining character joins the character before the cursor.
+        if c != '\0' && crate::wide::is_combining(c) {
+            self.add_combining_before_cursor(c);
             return Ok(());
         }
+
+        // Handle wide characters (2-column)
+        let width = ch.width();
+        let columns = self.maxx as usize + 1;
+        let (x, y) = if x + width > columns {
+            if width > columns {
+                // Wider than the window: it can never be drawn.
+                return Ok(());
+            }
+            // No room left on this line: blank the last cell and wrap, so
+            // that the character starts the next line.
+            self.lines[y].set(x, self.bkgrnd);
+            self.advance_cursor()?;
+            if self.curx != 0 {
+                // The cursor could not wrap: bottom line, and no scrolling.
+                return Ok(());
+            }
+            (0, self.cury as usize)
+        } else {
+            (x, y)
+        };
 
         // Write the character
         self.lines[y].set(x, ch);
@@ -915,6 +930,26 @@ impl Window {
         }
 
         Ok(())
+    }
+
+    /// Attach a combining character to the character before the cursor.
+    ///
+    /// It is dropped when there is no character before the cursor on this
+    /// line, or when that character has no room for another one.
+    #[cfg(feature = "wide")]
+    fn add_combining_before_cursor(&mut self, combining: char) {
+        let y = self.cury as usize;
+        let Some(mut x) = (self.curx as usize).checked_sub(1) else {
+            return;
+        };
+        // Step over the second cell of a double-width character.
+        if x > 0 && self.lines[y].get(x).is_null() {
+            x -= 1;
+        }
+        let mut cell = self.lines[y].get(x);
+        if cell.add_combining(combining) {
+            self.lines[y].set(x, cell);
+        }
     }
 
     /// Advance the cursor after character output.
@@ -1177,12 +1212,10 @@ impl Window {
             }
             #[cfg(feature = "wide")]
             {
+                // An empty cell is the second half of a double-width
+                // character; a cell can also hold combining characters.
                 let cchar = self.lines[y].get(x);
-                let c = cchar.spacing_char();
-                if c == '\0' {
-                    break;
-                }
-                result.push(c);
+                result.extend(cchar.chars.iter().take_while(|c| **c != '\0'));
             }
         }
 
@@ -1995,8 +2028,14 @@ impl Window {
             cchar.attr |= self.attrs;
         }
 
+        // A double-width character takes two cells: the character, then an
+        // empty cell. It is not inserted where only one cell is left.
         let width = cchar.width().max(1);
-        self.lines[y].insert(x, cchar, width);
+        if x + width > self.maxx as usize + 1 {
+            return Ok(());
+        }
+        self.lines[y].insert(x, CCharT::new(), width);
+        self.lines[y].set(x, cchar);
 
         Ok(())
     }
@@ -3045,6 +3084,127 @@ mod tests {
         win.mv(1, 0).unwrap();
         win.insdelln(-1).unwrap();
         assert_eq!(rows(&mut win), ["aaa", "ccc", "ddd", "eee", "   "]);
+    }
+
+    /// The spacing character of each cell of a line.
+    #[cfg(feature = "wide")]
+    fn cells(win: &Window, y: usize) -> Vec<char> {
+        (0..win.lines[y].width())
+            .map(|x| win.lines[y].get(x).spacing_char())
+            .collect()
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_double_width_character_takes_two_cells() {
+        let mut win = Window::new(1, 6, 0, 0).unwrap();
+        win.addstr("日本x").unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', '本', '\0', 'x', ' ']);
+        assert_eq!(win.getcurx(), 5);
+
+        // Reading the line back gives the text, not just its first character.
+        win.mv(0, 0).unwrap();
+        assert_eq!(win.instr(-1), "日本x ");
+        assert_eq!(win.instr(3), "日本");
+        win.mv(0, 2).unwrap();
+        assert_eq!(win.instr(-1), "本x ");
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_double_width_character_in_the_last_column_wraps() {
+        let mut win = Window::new(2, 5, 0, 0).unwrap();
+        win.mvaddstr(0, 3, "a日x").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 3));
+        assert_eq!(cells(&win, 0), [' ', ' ', ' ', 'a', ' ']);
+        assert_eq!(cells(&win, 1), ['日', '\0', 'x', ' ', ' ']);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_double_width_character_in_the_last_cell_of_the_window() {
+        // Without scrolling there is nowhere to wrap to: it is not drawn.
+        let mut win = Window::new(2, 5, 0, 0).unwrap();
+        win.mvaddstr(1, 4, "日").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 4));
+        assert_eq!(cells(&win, 1), [' '; 5]);
+
+        // With scrolling the window scrolls and it starts the new line.
+        let mut win = Window::new(2, 5, 0, 0).unwrap();
+        win.scrollok(true);
+        win.mvaddstr(0, 0, "top").unwrap();
+        win.mvaddstr(1, 3, "a日").unwrap();
+        assert_eq!((win.getcury(), win.getcurx()), (1, 2));
+        assert_eq!(cells(&win, 0), [' ', ' ', ' ', 'a', ' ']);
+        assert_eq!(cells(&win, 1), ['日', '\0', ' ', ' ', ' ']);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_double_width_character_wider_than_the_window_is_not_drawn() {
+        let mut win = Window::new(2, 1, 0, 0).unwrap();
+        win.addstr("日a").unwrap();
+        assert_eq!(cells(&win, 0), ['a']);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_combining_character_joins_the_character_before_it() {
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        win.addstr("e\u{301}x").unwrap();
+        assert_eq!(win.getcurx(), 2);
+        assert_eq!(cells(&win, 0), ['e', 'x', ' ', ' ']);
+        assert_eq!(win.lines[0].get(0).to_string(), "e\u{301}");
+        win.mv(0, 0).unwrap();
+        assert_eq!(win.instr(-1), "e\u{301}x  ");
+
+        // After a double-width character it joins that character.
+        let mut win = Window::new(1, 4, 0, 0).unwrap();
+        win.addstr("日\u{301}").unwrap();
+        assert_eq!(win.getcurx(), 2);
+        assert_eq!(win.lines[0].get(0).to_string(), "日\u{301}");
+        assert!(win.lines[0].get(1).is_null());
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_combining_character_with_nothing_to_join_is_dropped() {
+        // At the start of a line.
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addstr("\u{301}a").unwrap();
+        assert_eq!(cells(&win, 0), ['a', ' ', ' ']);
+        assert_eq!(win.lines[0].get(0).to_string(), "a");
+
+        // When the character already has all it can hold.
+        let mut win = Window::new(1, 3, 0, 0).unwrap();
+        win.addstr("a\u{301}\u{302}\u{303}\u{304}\u{305}\u{306}b")
+            .unwrap();
+        let held = crate::types::CCHARW_MAX - 1;
+        assert_eq!(win.lines[0].get(0).to_string().chars().count(), 1 + held);
+        assert_eq!(cells(&win, 0), ['a', 'b', ' ']);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_ins_wch_inserts_a_double_width_character_once() {
+        let mut win = Window::new(1, 6, 0, 0).unwrap();
+        win.addstr("abc").unwrap();
+        win.mv(0, 0).unwrap();
+        win.ins_wch(&CCharT::from_char('日')).unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', 'a', 'b', 'c', ' ']);
+        assert_eq!(win.getcurx(), 0);
+
+        win.mv(0, 2).unwrap();
+        win.ins_wch(&CCharT::from_char('x')).unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', 'x', 'a', 'b', 'c']);
+
+        // No room for both cells in the last column: nothing is inserted.
+        win.mv(0, 5).unwrap();
+        win.ins_wch(&CCharT::from_char('本')).unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', 'x', 'a', 'b', 'c']);
+        win.mv(0, 4).unwrap();
+        win.ins_wch(&CCharT::from_char('本')).unwrap();
+        assert_eq!(cells(&win, 0), ['日', '\0', 'x', 'a', '本', '\0']);
     }
 
     #[test]

@@ -986,14 +986,14 @@ impl Screen {
                     last_attr = new_attr;
                 }
 
-                // Output the character
-                let c = cell.spacing_char();
-                if c == '\0' {
+                // Output the character, with its combining characters
+                if cell.is_null() {
                     self.terminal.write(b" ")?;
                 } else {
                     let mut buf = [0u8; 4];
-                    let s = c.encode_utf8(&mut buf);
-                    self.terminal.write(s.as_bytes())?;
+                    for c in cell.chars.iter().take_while(|c| **c != '\0') {
+                        self.terminal.write(c.encode_utf8(&mut buf).as_bytes())?;
+                    }
                 }
 
                 // A double-width character moves the cursor two columns.
@@ -5443,6 +5443,8 @@ mod output_tests {
         /// The character in each cell; `'\0'` is the second cell of a
         /// double-width character.
         cells: Vec<Vec<char>>,
+        /// The combining characters drawn onto each cell.
+        combining: Vec<Vec<String>>,
         y: usize,
         x: usize,
     }
@@ -5451,6 +5453,7 @@ mod output_tests {
         fn new(lines: usize, cols: usize) -> Self {
             Self {
                 cells: vec![vec![' '; cols]; lines],
+                combining: vec![vec![String::new(); cols]; lines],
                 y: 0,
                 x: 0,
             }
@@ -5501,11 +5504,25 @@ mod output_tests {
         }
 
         fn print(&mut self, c: char) {
-            let width = crate::wide::char_width(c).max(1);
             let Some(line) = self.cells.get_mut(self.y) else {
                 return;
             };
+            if crate::wide::is_combining(c) {
+                // Joins the character before the cursor, which stays put.
+                let before = match self.x.checked_sub(1) {
+                    Some(x) if line[x] == '\0' => x.checked_sub(1),
+                    before => before,
+                };
+                if let Some(x) = before {
+                    self.combining[self.y][x].push(c);
+                }
+                return;
+            }
+            let width = crate::wide::char_width(c).max(1);
             if self.x + width <= line.len() {
+                for x in self.x..self.x + width {
+                    self.combining[self.y][x].clear();
+                }
                 // Writing over half of a double-width character blanks the
                 // other half.
                 if line[self.x] == '\0' {
@@ -5527,14 +5544,24 @@ mod output_tests {
             for line in &mut self.cells {
                 line.fill(c);
             }
+            for line in &mut self.combining {
+                line.fill(String::new());
+            }
         }
 
         /// The text of each line, without trailing blanks.
         fn rows(&self) -> Vec<String> {
             self.cells
                 .iter()
-                .map(|line| {
-                    let text: String = line.iter().filter(|c| **c != '\0').collect();
+                .zip(&self.combining)
+                .map(|(line, combining)| {
+                    let mut text = String::new();
+                    for (c, combining) in line.iter().zip(combining) {
+                        if *c != '\0' {
+                            text.push(*c);
+                            text.push_str(combining);
+                        }
+                    }
                     text.trim_end().to_string()
                 })
                 .collect()
@@ -5657,6 +5684,28 @@ mod output_tests {
         assert_eq!(t.refresh(), ["日本ab", ""]);
         // Each double-width character takes two columns and no more.
         assert_eq!(t.shown.cells[0][..6], ['日', '\0', '本', '\0', 'a', 'b']);
+    }
+
+    #[test]
+    fn test_double_width_character_in_the_last_column_wraps() {
+        let mut t = TestScreen::new(2, 5);
+        t.screen.mvaddstr(0, 3, "a日x").unwrap();
+        assert_eq!(t.refresh(), ["   a", "日x"]);
+    }
+
+    #[test]
+    fn test_combining_characters_are_drawn_on_their_base_character() {
+        let mut t = TestScreen::new(2, 6);
+        t.screen.mvaddstr(0, 0, "e\u{301}x").unwrap();
+        t.screen.mvaddstr(1, 0, "日\u{301}y").unwrap();
+        assert_eq!(t.refresh(), ["e\u{301}x", "日\u{301}y"]);
+        // The combining character takes no column of its own.
+        assert_eq!(t.shown.cells[0][..2], ['e', 'x']);
+        assert_eq!(t.shown.cells[1][..3], ['日', '\0', 'y']);
+
+        // Overwriting the base character removes its combining character.
+        t.screen.mvaddstr(0, 0, "a").unwrap();
+        assert_eq!(t.refresh(), ["ax", "日\u{301}y"]);
     }
 
     #[test]
