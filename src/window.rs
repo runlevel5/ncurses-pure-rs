@@ -1703,10 +1703,19 @@ impl Window {
         self.lines[y as usize].set(x as usize, CCharT::from_char_attr(c, attr));
     }
 
+    /// How many cells a line of `n` draws when `room` cells are left before
+    /// the window's edge: none for a zero or negative `n`.
+    fn line_len(n: i32, room: i32) -> usize {
+        n.min(room).max(0) as usize
+    }
+
     /// Draw a horizontal line.
+    ///
+    /// The line starts at the cursor and is at most `n` cells long, cut off
+    /// at the window's edge. Nothing is drawn when `n` is zero or negative.
     pub fn hline(&mut self, ch: ChType, n: i32) -> Result<()> {
         let ch = if ch == 0 { self.acs_hline() } else { ch };
-        let n = n.min((self.maxx - self.curx + 1) as i32) as usize;
+        let n = Self::line_len(n, (self.maxx - self.curx + 1) as i32);
         let y = self.cury as usize;
         let x = self.curx as usize;
 
@@ -1732,9 +1741,12 @@ impl Window {
     }
 
     /// Draw a vertical line.
+    ///
+    /// The line starts at the cursor and is at most `n` cells long, cut off
+    /// at the window's edge. Nothing is drawn when `n` is zero or negative.
     pub fn vline(&mut self, ch: ChType, n: i32) -> Result<()> {
         let ch = if ch == 0 { self.acs_vline() } else { ch };
-        let n = n.min((self.maxy - self.cury + 1) as i32) as usize;
+        let n = Self::line_len(n, (self.maxy - self.cury + 1) as i32);
         let y = self.cury as usize;
         let x = self.curx as usize;
 
@@ -1767,7 +1779,7 @@ impl Window {
         } else {
             *wch
         };
-        let n = n.min((self.maxx - self.curx + 1) as i32) as usize;
+        let n = Self::line_len(n, (self.maxx - self.curx + 1) as i32);
         let y = self.cury as usize;
         let x = self.curx as usize;
 
@@ -1786,7 +1798,7 @@ impl Window {
         } else {
             *wch
         };
-        let n = n.min((self.maxy - self.cury + 1) as i32) as usize;
+        let n = Self::line_len(n, (self.maxy - self.cury + 1) as i32);
         let y = self.cury as usize;
         let x = self.curx as usize;
 
@@ -2676,6 +2688,39 @@ mod tests {
                 win.instr(3)
             })
             .collect()
+    }
+
+    #[test]
+    fn test_hline_and_vline_draw_nothing_for_a_negative_count() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.mv(1, 1).unwrap();
+        for n in [0, -1, i32::MIN] {
+            win.hline('-' as ChType, n).unwrap();
+            win.vline('|' as ChType, n).unwrap();
+        }
+        assert_eq!(rows(&mut win), ["   ", "   ", "   "]);
+    }
+
+    #[cfg(feature = "wide")]
+    #[test]
+    fn test_hline_set_and_vline_set_draw_nothing_for_a_negative_count() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.mv(1, 1).unwrap();
+        let ch = CCharT::from_char('x');
+        for n in [0, -1, i32::MIN] {
+            win.hline_set(&ch, n).unwrap();
+            win.vline_set(&ch, n).unwrap();
+        }
+        assert_eq!(rows(&mut win), ["   ", "   ", "   "]);
+    }
+
+    #[test]
+    fn test_hline_and_vline_stop_at_the_window_edge() {
+        let mut win = Window::new(3, 3, 0, 0).unwrap();
+        win.mv(1, 1).unwrap();
+        win.hline('-' as ChType, 10).unwrap();
+        win.vline('|' as ChType, 10).unwrap();
+        assert_eq!(rows(&mut win), ["   ", " |-", " | "]);
     }
 
     #[test]
