@@ -596,6 +596,18 @@ impl Field {
             .unwrap_or("")
     }
 
+    /// The number of characters in `line`. The cursor column and the field
+    /// width count characters, not bytes.
+    fn char_len(line: &str) -> usize {
+        line.chars().count()
+    }
+
+    /// The byte offset in `line` of the character in column `col`, or the
+    /// length of `line` when `col` is at or past its end.
+    fn byte_offset(line: &str, col: usize) -> usize {
+        line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
+    }
+
     /// Insert a character at the cursor position.
     pub fn insert_char(&mut self, ch: char) {
         // Ensure we have enough rows
@@ -606,12 +618,14 @@ impl Field {
         // Check if we need to limit the input (O_STATIC means fixed size)
         if self.opts.contains(FieldOpts::O_STATIC) {
             // For single-line fields, check width
-            if self.height == 1 && self.buffer[self.cursor_row].len() >= self.width as usize {
+            if self.height == 1
+                && Self::char_len(&self.buffer[self.cursor_row]) >= self.width as usize
+            {
                 return;
             }
             // For multi-line fields, check total capacity
             if self.height > 1 {
-                let total_chars: usize = self.buffer.iter().map(|s| s.len()).sum();
+                let total_chars: usize = self.buffer.iter().map(|s| Self::char_len(s)).sum();
                 let max_chars = (self.height + self.offscreen) as usize * self.width as usize;
                 if total_chars >= max_chars {
                     return;
@@ -621,8 +635,8 @@ impl Field {
 
         let cursor_col = self.cursor_col;
         let line = &mut self.buffer[self.cursor_row];
-        if cursor_col <= line.len() {
-            line.insert(cursor_col, ch);
+        if cursor_col <= Self::char_len(line) {
+            line.insert(Self::byte_offset(line, cursor_col), ch);
             self.cursor_col += 1;
         }
 
@@ -637,27 +651,30 @@ impl Field {
     /// Wrap the current line if it exceeds the field width.
     fn wrap_line_if_needed(&mut self) {
         let width = self.width as usize;
-        if self.buffer[self.cursor_row].len() > width {
+        if Self::char_len(&self.buffer[self.cursor_row]) > width {
             // Find the last space before the width limit, or just break at width
             let line = &self.buffer[self.cursor_row];
-            let break_pos = line[..width]
+            let limit = Self::byte_offset(line, width);
+            let break_pos = line[..limit]
                 .rfind(' ')
                 .map(|p| p + 1) // Break after the space
-                .unwrap_or(width);
+                .unwrap_or(limit);
+            // The column the break falls on
+            let break_col = Self::char_len(&line[..break_pos]);
 
             let rest = self.buffer[self.cursor_row].split_off(break_pos);
 
             // Move cursor to next line if it was past the break
-            if self.cursor_col >= break_pos {
+            if self.cursor_col >= break_col {
                 // Insert a new line or append to next
                 if self.cursor_row + 1 < self.buffer.len() {
                     let next_line = &mut self.buffer[self.cursor_row + 1];
                     let old_len = rest.len();
                     *next_line = rest + next_line;
                     self.cursor_row += 1;
-                    self.cursor_col -= break_pos;
+                    self.cursor_col -= break_col;
                     // If we just added content to an existing line, it might need wrapping too
-                    if next_line.len() > width {
+                    if Self::char_len(next_line) > width {
                         self.wrap_line_if_needed();
                     }
                     // Adjust cursor position
@@ -665,7 +682,7 @@ impl Field {
                 } else {
                     self.buffer.push(rest);
                     self.cursor_row += 1;
-                    self.cursor_col -= break_pos;
+                    self.cursor_col -= break_col;
                 }
             }
         }
@@ -677,15 +694,15 @@ impl Field {
         let cursor_row = self.cursor_row;
         if cursor_col > 0 {
             let line = &mut self.buffer[cursor_row];
-            if cursor_col <= line.len() {
+            if cursor_col <= Self::char_len(line) {
                 self.cursor_col -= 1;
-                line.remove(self.cursor_col);
+                line.remove(Self::byte_offset(line, self.cursor_col));
             }
         } else if cursor_row > 0 {
             // At beginning of line - join with previous line
             let current_line = self.buffer.remove(cursor_row);
             self.cursor_row -= 1;
-            self.cursor_col = self.buffer[self.cursor_row].len();
+            self.cursor_col = Self::char_len(&self.buffer[self.cursor_row]);
             self.buffer[self.cursor_row].push_str(&current_line);
         }
         self.adjust_scroll();
@@ -696,8 +713,8 @@ impl Field {
         let cursor_col = self.cursor_col;
         let cursor_row = self.cursor_row;
         let line = &mut self.buffer[cursor_row];
-        if cursor_col < line.len() {
-            line.remove(cursor_col);
+        if cursor_col < Self::char_len(line) {
+            line.remove(Self::byte_offset(line, cursor_col));
         } else if cursor_row + 1 < self.buffer.len() {
             // At end of line - join with next line
             let next_line = self.buffer.remove(cursor_row + 1);
@@ -712,14 +729,14 @@ impl Field {
         } else if self.cursor_row > 0 {
             // Wrap to end of previous line
             self.cursor_row -= 1;
-            self.cursor_col = self.buffer[self.cursor_row].len();
+            self.cursor_col = Self::char_len(&self.buffer[self.cursor_row]);
         }
         self.adjust_scroll();
     }
 
     /// Move cursor right.
     pub fn cursor_right(&mut self) {
-        let line_len = self.current_line().len();
+        let line_len = Self::char_len(self.current_line());
         if self.cursor_col < line_len {
             self.cursor_col += 1;
         } else if self.cursor_row + 1 < self.buffer.len() {
@@ -735,7 +752,7 @@ impl Field {
         if self.cursor_row > 0 {
             self.cursor_row -= 1;
             // Clamp column to line length
-            let line_len = self.current_line().len();
+            let line_len = Self::char_len(self.current_line());
             if self.cursor_col > line_len {
                 self.cursor_col = line_len;
             }
@@ -748,7 +765,7 @@ impl Field {
         if self.cursor_row + 1 < self.buffer.len() {
             self.cursor_row += 1;
             // Clamp column to line length
-            let line_len = self.current_line().len();
+            let line_len = Self::char_len(self.current_line());
             if self.cursor_col > line_len {
                 self.cursor_col = line_len;
             }
@@ -767,7 +784,7 @@ impl Field {
     pub fn cursor_end(&mut self) {
         if !self.buffer.is_empty() {
             self.cursor_row = self.buffer.len() - 1;
-            self.cursor_col = self.buffer[self.cursor_row].len();
+            self.cursor_col = Self::char_len(&self.buffer[self.cursor_row]);
         }
         self.adjust_scroll();
     }
@@ -780,7 +797,7 @@ impl Field {
 
     /// Move cursor to end of current line.
     pub fn cursor_line_end(&mut self) {
-        self.cursor_col = self.current_line().len();
+        self.cursor_col = Self::char_len(self.current_line());
         self.adjust_scroll();
     }
 
@@ -845,7 +862,7 @@ impl Field {
         if self.cursor_col == 0 {
             if self.cursor_row > 0 {
                 self.cursor_row -= 1;
-                self.cursor_col = self.current_line().len();
+                self.cursor_col = Self::char_len(self.current_line());
             }
             self.adjust_scroll();
             return;
@@ -871,7 +888,8 @@ impl Field {
     /// Insert a new line at the cursor position.
     pub fn insert_line(&mut self) {
         // Split the current line at cursor position
-        let rest = self.buffer[self.cursor_row].split_off(self.cursor_col);
+        let line = &mut self.buffer[self.cursor_row];
+        let rest = line.split_off(Self::byte_offset(line, self.cursor_col));
         self.cursor_row += 1;
         self.buffer.insert(self.cursor_row, rest);
         self.cursor_col = 0;
@@ -885,7 +903,7 @@ impl Field {
             if self.cursor_row >= self.buffer.len() {
                 self.cursor_row = self.buffer.len() - 1;
             }
-            let line_len = self.current_line().len();
+            let line_len = Self::char_len(self.current_line());
             if self.cursor_col > line_len {
                 self.cursor_col = line_len;
             }
@@ -902,7 +920,7 @@ impl Field {
         let cursor_col = self.cursor_col;
         let cursor_row = self.cursor_row;
         let line = &mut self.buffer[cursor_row];
-        line.truncate(cursor_col);
+        line.truncate(Self::byte_offset(line, cursor_col));
     }
 
     /// Delete from cursor to end of field.
@@ -932,7 +950,9 @@ impl Field {
 
         // Remove the characters
         if end > cursor_col {
-            self.buffer[cursor_row].replace_range(cursor_col..end, "");
+            let line = &mut self.buffer[cursor_row];
+            let range = Self::byte_offset(line, cursor_col)..Self::byte_offset(line, end);
+            line.replace_range(range, "");
         }
     }
 
@@ -979,7 +999,12 @@ impl Field {
 
     /// Scroll field horizontally forward by n columns.
     pub fn scroll_hforward(&mut self, n: usize) {
-        let max_col = self.buffer.iter().map(|s| s.len()).max().unwrap_or(0);
+        let max_col = self
+            .buffer
+            .iter()
+            .map(|s| Self::char_len(s))
+            .max()
+            .unwrap_or(0);
         let max_scroll = max_col.saturating_sub(self.width as usize);
         self.scroll_col = (self.scroll_col + n).min(max_scroll);
     }
@@ -2428,6 +2453,164 @@ mod tests {
 
         field.cursor_prev_word();
         assert_eq!(field.cursor_col(), 0); // Back at 'h' in "hello"
+    }
+
+    /// A one-line field holding `text`, with the cursor on column `col`.
+    fn field_at(text: &str, col: usize) -> Field {
+        let mut field = Field::new(1, 20, 0, 0, 0, 0);
+        field.set_buffer(text);
+        for _ in 0..col {
+            field.cursor_right();
+        }
+        assert_eq!(field.cursor_col(), col);
+        field
+    }
+
+    #[test]
+    fn test_field_insert_non_ascii() {
+        let mut field = Field::new(1, 20, 0, 0, 0, 0);
+        for ch in ['é', 'a', '日', 'z'] {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "éa日z");
+        assert_eq!(field.cursor_col(), 4);
+
+        let mut field = field_at("日本", 1);
+        field.insert_char('x');
+        assert_eq!(field.buffer(), "日x本");
+        assert_eq!(field.cursor_col(), 2);
+    }
+
+    #[test]
+    fn test_field_cursor_counts_characters() {
+        let mut field = field_at("café", 0);
+        field.cursor_line_end();
+        assert_eq!(field.cursor_col(), 4);
+        field.cursor_right();
+        assert_eq!(field.cursor_col(), 4);
+        field.cursor_left();
+        assert_eq!(field.cursor_col(), 3);
+        field.cursor_home();
+        field.cursor_end();
+        assert_eq!(field.cursor_col(), 4);
+
+        // Moving between lines keeps the column inside the shorter line.
+        let mut field = Field::new(3, 20, 0, 0, 0, 0);
+        field.set_buffer("ñandú\nñu\nñandú");
+        field.cursor_line_end();
+        assert_eq!(field.cursor_pos(), (0, 5));
+        field.cursor_down();
+        assert_eq!(field.cursor_pos(), (1, 2));
+        field.cursor_right();
+        assert_eq!(field.cursor_pos(), (2, 0));
+        field.cursor_left();
+        assert_eq!(field.cursor_pos(), (1, 2));
+        field.cursor_prev_word();
+        field.cursor_prev_word();
+        assert_eq!(field.cursor_pos(), (0, 5));
+    }
+
+    #[test]
+    fn test_field_delete_non_ascii() {
+        let mut field = field_at("héllo", 2);
+        field.delete_prev();
+        assert_eq!(field.buffer(), "hllo");
+        assert_eq!(field.cursor_col(), 1);
+
+        let mut field = field_at("héllo", 1);
+        field.delete_char();
+        assert_eq!(field.buffer(), "hllo");
+        assert_eq!(field.cursor_col(), 1);
+
+        // Deleting at the end of the line does nothing.
+        let mut field = field_at("né", 2);
+        field.delete_char();
+        assert_eq!(field.buffer(), "né");
+
+        let mut field = field_at("añb", 2);
+        field.clear_to_eol();
+        assert_eq!(field.buffer(), "añ");
+
+        let mut field = field_at("añ ñb cd", 3);
+        field.delete_word();
+        assert_eq!(field.buffer(), "añ cd");
+    }
+
+    #[test]
+    fn test_field_split_and_join_lines_with_non_ascii() {
+        let mut field = Field::new(3, 20, 0, 0, 0, 0);
+        field.set_buffer("añb");
+        field.cursor_right();
+        field.cursor_right();
+        field.insert_line();
+        assert_eq!(field.buffer(), "añ\nb");
+        assert_eq!(field.cursor_pos(), (1, 0));
+
+        field.delete_prev();
+        assert_eq!(field.buffer(), "añb");
+        assert_eq!(field.cursor_pos(), (0, 2));
+
+        field.insert_line();
+        field.cursor_up();
+        field.cursor_line_end();
+        field.delete_char();
+        assert_eq!(field.buffer(), "añb");
+    }
+
+    #[test]
+    fn test_field_width_counts_characters() {
+        // A static one-line field holds as many characters as it is wide.
+        let mut field = Field::new(1, 3, 0, 0, 0, 0);
+        for _ in 0..5 {
+            field.insert_char('é');
+        }
+        assert_eq!(field.buffer(), "ééé");
+
+        // A multi-line field wraps after that many characters.
+        let mut field = Field::new(2, 3, 0, 0, 0, 0);
+        for ch in "éééx".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "ééé\nx");
+        assert_eq!(field.cursor_pos(), (1, 1));
+
+        // Wrapping at a space works on characters too.
+        let mut field = Field::new(2, 4, 0, 0, 0, 0);
+        for ch in "é éñx".chars() {
+            field.insert_char(ch);
+        }
+        assert_eq!(field.buffer(), "é \néñx");
+        assert_eq!(field.cursor_pos(), (1, 3));
+
+        // Horizontal scrolling stops at the last character.
+        let mut field = Field::new(1, 2, 0, 0, 0, 0);
+        field.set_buffer("ééé");
+        field.scroll_hforward(10);
+        assert_eq!(field.scroll_col(), 1);
+    }
+
+    #[test]
+    fn test_form_editing_non_ascii() {
+        let mut form = Form::new(vec![Field::new(1, 20, 0, 0, 0, 0)]);
+        form.current_field()
+            .unwrap()
+            .borrow_mut()
+            .set_buffer("café");
+        form.driver(REQ_END_LINE).unwrap();
+        form.driver(REQ_LEFT_CHAR).unwrap();
+        form.driver(REQ_DEL_CHAR).unwrap();
+        assert_eq!(form.data()[0], "caf");
+
+        form.current_field()
+            .unwrap()
+            .borrow_mut()
+            .set_buffer("café");
+        form.driver(REQ_END_LINE).unwrap();
+        form.driver('!' as i32).unwrap();
+        assert_eq!(form.data()[0], "café!");
+        form.driver(REQ_DEL_PREV).unwrap();
+        form.driver(REQ_DEL_PREV).unwrap();
+        assert_eq!(form.data()[0], "caf");
     }
 
     #[test]
